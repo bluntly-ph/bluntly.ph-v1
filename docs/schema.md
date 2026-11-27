@@ -1,0 +1,249 @@
+# Bluntly.ph — Data Dictionary (as migrated, M0)
+
+15 tables, UUID primary keys (`gen_random_uuid()`) + human-readable ID strings,
+timestamps via `created_at`/`updated_at`. Source of truth: `backend/app/models/`,
+migrated by `backend/alembic/versions/`. This reflects the schema **as actually
+migrated**; deviations from the original Data Dictionary are in
+[`DEVIATIONS.md`](./DEVIATIONS.md).
+
+## Current state (2026-08-20)
+
+**28 tables, at revision `0025_receipt_view_audit`.** The sections below narrate
+how the schema grew milestone by milestone and stop at M3; this is where it
+actually stands.
+
+Migrations after the M3 narrative:
+
+| Revision | Change | Class |
+|---|---|---|
+| `0019`–`0022` | product images, affiliate postbacks, review comments, drop `review_requests.bounty` | mixed |
+| `0023_receipt_object_key` | `reviews.receipt_url` → `receipt_key`; strips the locator from 675 version snapshots | **contracting** |
+| `0024_drop_seller_reviews` | drops `seller_reviews` + `users.seller_trust_score` / `seller_aggregates` | **contracting** |
+| `0025_receipt_view_audit` | adds `moderation_action.receipt_view` | additive |
+
+`0023` and `0024` each caused a brief production outage by being applied ahead
+of compatible code — see `docs/ENVIRONMENTS.md` for the expand→contract rule and
+`scripts/check_migration_safety.py`, which flags both.
+
+Production row counts after the 2026-08-20 fixture cleanup: 14 users, 15
+reviews, 16 products, 6 publicly visible reviews, 0 orphaned rows.
+
+## Enum types (`app/models/enums.py`)
+`member_role`(user/seller/moderator) · `member_type`(shopper/seller/moderator) ·
+`language`(en/fil/tl-x-taglish) · `product_status`(pending/canonicalized/rejected) ·
+`platform`(shopee/lazada/other) · `verdict`(yes_absolutely/it_depends/hard_pass) ·
+`verification_status`(verified/unverified) · `verification_tier`(tier_0/tier_1) ·
+`earn_eligible_status`(none/pending/approved/rejected/monetized/honesty_fund) ·
+`question_directed_to`(buyers/seller) · `conversion_status`(clicked/converted/cancelled) ·
+`commission_target`(review/answer) · `moderation_target_type` · `moderation_action`
+(incl. audit actions csv_import/payout/honesty_fund_distribution) · `moderation_reason` ·
+`vote_direction`(up/down).
+
+## Tables
+
+| # | Table | Purpose | Key columns / notes |
+|---|---|---|---|
+| 1 | `users` | Profile keyed to Supabase `auth.users.id` | `id`(=JWT sub, PK, no auto-gen), `role`, `member_type`, `language`, `reputation_score`(0–100), `trust_stage`, **`trust_level_name`** (GENERATED ALWAYS), aggregates, `wallet_balance`, `payout_account`(sensitive). **No `password_hash`** (ADR-008). No `share_percentage` (removed). |
+| 2 | `badges` | Badge definitions | `badge_id`, `name`, `criteria`(JSONB) |
+| 3 | `user_badges` | Awarded badges | FK users/badges CASCADE, `uq(user_id,badge_id)` |
+| 4 | `products` | Canonical products | `status`(pending→canonicalized), `source_url`, canonical name parts, denormalized `avg_rating`/`review_count`/`aggregated_pros/cons`(JSONB) |
+| 5 | `product_platforms` | Per-platform listing | `platform`, `platform_url`, `is_monetizable`(Lazada A6), `uq(product,platform,url)` |
+| 6 | `price_history` | Community price observations | `platform`, `price`, `variant`, `observed_at`, `submitted_by`. Never scraped. |
+| 7 | `reviews` | Structured reviews | `verdict`, `star_rating`, `pros/cons`(JSONB), `photo_url`, `receipt_url`, `verification_status`, `verification_tier`, `wilson_score`, `earn_eligible_status`, `affiliate_link` |
+| 8 | `questions` | Q&A questions | `directed_to`, `best_answer_id`(deferred FK, use_alter) |
+| 9 | `answers` | Q&A answers | `is_best_answer`, `is_first_responder`, `wilson_score`, **`earn_eligible`(unwired, ADR-006)** |
+| 10 | `seller_reviews` | 4-dimension seller reviews — **withdrawn 2026-07-28**, see note below | `accuracy`, `order_completeness`(binary), `customer_service`, `packaging_quality`, `overall_rating`, `would_recommend` |
+| 11 | `sessions` | Affiliate click tracking + PII lifecycle | `click_ref`/`order_ref`, `conversion_status`, `user_agent`, `ip_address`, `ip_hash`, precomputed `ua_purge_at`/`ip_hash_at`/`ip_delete_at` |
+| 12 | `commissions` | Reconciled commissions | `target_type`+typed `review_id`/`answer_id` FKs (CHECK), 40/30/30 shares, `uq(csv_source,row_reference)` (idempotency) |
+| 13 | `honesty_fund_distributions` | Monthly HF payouts | `cycle_month`, `honesty_score`, `pool_amount`, `payout_amount`, `uq(cycle_month,review_id)` |
+| 14 | `moderation_logs` | Moderation **+ audit log** | polymorphic `target_type`/`target_ref`, `action`, `reason`, `context`(JSONB) |
+| 15 | `earn_eligible_votes` | Gate votes w/ immutable snapshots | `vote_weight`, `trust_stage_snapshot`, `trust_score_snapshot`, `account_age_days_snapshot`, `is_probation_snapshot`, `uq(review_id,voter_id)` |
+
+## M1 additions (schema grew 15 → 17 tables)
+
+| # | Table | Purpose | Key columns |
+|---|---|---|---|
+| 16 | `membership_tiers` | Tier config (ADR-012) | `code`(special/founding/standard, unique), `name`, `revenue_share_bps`, `payout_priority`, `benefits`(JSONB), `is_active` |
+| 17 | `review_versions` | Review edit history | `review_id`(FK CASCADE), `version_number`, `snapshot`(JSONB), `edited_by`, `change_note`, `uq(review_id,version_number)` |
+
+New columns (M1): `users.password_hash` (Argon2id, ADR-011), `users.is_suspended`,
+`users.membership_tier` (enum, default standard, ADR-012); `reviews.current_version`.
+`users.id` gains a `gen_random_uuid()` default (ADR-010, no longer the Supabase uid).
+
+## M2 slice-1 additions (referral link flow — 18 → 19 tables)
+
+| # | Table | Purpose | Key columns |
+|---|---|---|---|
+| 19 | `referral_links` | Affiliate link history + audit | `review_id`(FK CASCADE), `platform`, `url`, `status`(referral_link_status active/revoked), `review_version`, `created_by`, `revoked_by`/`revoked_at`/`revoke_reason`. Partial unique `UNIQUE(review_id) WHERE status='active'` (one active link per review). RLS on (public SELECT). |
+
+New enum type `referral_link_status`(active/revoked). `platform` gains **`amazon`**;
+`moderation_action` gains `affiliate_link_attach`, `affiliate_link_revoke`,
+`publish`, `unpublish`. New column **`reviews.published_at`** (nullable; publication
+gate — NULL = hidden). `reviews.affiliate_link` is the active-link mirror; the raw
+value is never exposed in API responses (only the `/r/{id}` redirect is).
+
+## M2 slices 2–8 additions (19 → 21 tables; migrations 0005–0009)
+
+| # | Table | Purpose | Key columns |
+|---|---|---|---|
+| 20 | `review_votes` | Equal-weight community visibility votes (slice 2) | `review_id`(FK CASCADE), `voter_id`(FK CASCADE), `vote`(vote_direction), `uq(review_id,voter_id)` — one vote per user per review, changing = upsert. RLS on (public SELECT). |
+| 21 | `token_transactions` | Append-only token ledger (slice 7) | `user_id`(FK CASCADE), `amount`(±, CHECK ≠0), `balance_after`, `kind`(token_kind), polymorphic `ref_type`/`ref_id`, `note`, `created_by`. Index `(user_id, created_at DESC)`. Partial unique `uq_token_once(user_id,kind,ref_id) WHERE ref_id IS NOT NULL AND kind LIKE 'earn_%'` (a review/commission awards once). RLS on with **no permissive policy** (like `sessions`). |
+
+New enum type `token_kind`(earn_review_published/earn_commission/admin_grant/
+admin_deduct/adjustment). New columns: **`products.trust_score`** Numeric(6,5)
+(time-decayed Wilson over published reviews with stars ≥ 4, slice 4);
+**`users.seller_trust_score`** Numeric(6,5) NULL + per-dimension aggregates in the
+existing `users.seller_aggregates` JSONB (slice 4); **`users.token_balance`** int
+(ledger mirror, slice 7); **`commissions.reviewer_tier`** + 
+**`commissions.reviewer_share_bps`** (immutable tier snapshot at reconciliation,
+slice 6). New constraint `uq_seller_review_once(seller_id, reviewer_id)` on
+`seller_reviews` (slice 4). Extension **`pg_trgm`** + GIN index
+`ix_reviews_discussion_trgm` on `reviews.discussion` (duplicate-content signal,
+slice 5).
+
+> **Withdrawn 2026-07-28 (owner decision).** Seller trust ratings were built and
+> verified in M2, then removed: bluntly.ph is an affiliate-review platform, not a
+> seller directory. `seller_reviews`, `users.seller_trust_score`, and
+> `users.seller_aggregates` are removed from the frontend, API, and model;
+> `0024_drop_seller_reviews` drops the table (2026-08-19). The `0021` cited here before was never written. The
+> `uq_seller_review_once` constraint above went with the table. `products.trust_score`
+> (M2 slices 2–8 additions above) is unaffected. Frontend removal: `cf7afbc`;
+> backend removal: `8936dda`; types/remnants sweep: `9366a5b`; verification-script
+> update: `b0f8ba0`.
+
+## M3 additions (21 → 24 tables; migrations 0010–0014)
+Documented late — these shipped with M3 but were missing from this file:
+**`review_requests`** (the request board: bounty escrow, status, AI screening
+reasons), **`request_upvotes`** (one row per user per request; drives the capped
+`effective_reward` top-up), **`review_contracts`** (6-month revenue-share term,
+`auto_renew`, pending `buyout_offer_amount`). Plus `referral_links.sub_id` +
+`sub_id_in_url` (0013) — the affiliate attribution key, unique among *active*
+links only.
+
+## Slice 1 Phase A additions (24 → 25 tables; migrations 0015–0017)
+
+**`email_otps`** (0015) — one-time codes for passwordless auth:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | `gen_random_uuid()` |
+| `email` | String(320), indexed | **Not** FK'd to `users` — a signup code precedes the user row |
+| `code_hash` | String(255) | Argon2id. The plaintext code is never stored |
+| `purpose` | enum `otp_purpose` (`signup`\|`login`) | |
+| `attempts` | SmallInteger, default 0 | **Authoritative** verify limit — Redis fails open |
+| `expires_at` | timestamptz | issued + `OTP_TTL_SECONDS` (600) |
+| `consumed_at` | timestamptz NULL | single-use |
+| `created_at` | timestamptz | |
+
+Indexes: `ix_email_otps_email`, plus partial `ix_email_otps_live (email, purpose)
+WHERE consumed_at IS NULL` for the "find this address's live code" hot path.
+
+**`users.username`** String(32) UNIQUE NOT NULL (0016) — the stable public
+handle; `display_name` remains the free-text label. Backfilled deterministically
+from `display_name` → email local-part → `user`, with a numeric suffix on
+collision; the SQL slug mirrors `app/services/username.py`.
+
+**`users.avatar_url`** Text NULL (0017) — public URL of an object in the
+Supabase Storage `avatars` bucket.
+
+### Storage buckets
+
+Buckets are created in the Supabase dashboard, not by a migration, so a new one
+is a deploy step rather than something `alembic upgrade` picks up.
+
+Buckets are classified by **audience**, not by what uploaded them. The
+distinction below is load-bearing and must not be collapsed: it is what
+BUG-029 was.
+
+| Bucket | Public | Max object | Holds | Written by |
+|---|---|---|---|---|
+| `avatars` | yes | 4 MB | Profile pictures | `POST /users/me/avatar` |
+| `product-images` | yes | 5 MB | Product listing imagery | `scripts/seed_product_images.py`, admin upload |
+| `review-photos` | yes | 4 MB | The product photograph shown **on** a published review (FR-3) | `POST /reviews/photo` |
+| **`review-receipts`** | **no** | 4 MB | **Proof of purchase — evidence for `earn_eligible` evaluation (FR-3, FR-9)** | `POST /reviews/receipt` |
+
+The three caps that go through a serverless function are 4 MB, not a round
+number: measured against production, the platform refuses a request body
+somewhere between 3.0 MB and 4.4 MB with a bare `413` before any of our code
+runs, so a higher cap is one the API can never enforce — the reader gets a
+platform error page instead of a sentence. `product-images` stays at 5 MB
+because `seed_product_images.py` uploads straight to Supabase Storage and never
+crosses a function. See `UPLOAD_CEILING_BYTES` in `app/services/storage.py`.
+
+### Public review media vs. private proof of purchase
+
+A **review photo** is review content: the reviewer's own picture of the thing,
+drawn on the published page, and the first layer of the fraud framework
+(FR-8.1). Public is correct for it.
+
+A **receipt** is not review content. It routinely carries the buyer's name,
+delivery address, order number and prices. Readers never see it; its audience
+is the author and the moderators evaluating the `earn_eligible` gate.
+
+**Access rules**
+
+| Caller | Public review photo | Receipt |
+|---|---|---|
+| Anonymous | may read | no locator in any response; no storage access; 401 from the receipt endpoint |
+| Authenticated, unrelated | may read | 404 — deliberately not 403, which would confirm a receipt exists |
+| Review author | may read | `GET /reviews/{id}/receipt` → short-lived signed URL |
+| Moderator | may read | same endpoint; this is how the queue's "proof of purchase" control works |
+
+**How access is granted.** `reviews.receipt_key` holds an opaque object key,
+never a URL. No response model carries it — `ReviewOut` exposes `has_receipt`,
+the fact without the location. `GET /reviews/{id}/receipt` authorizes *first*,
+then mints a signed URL with `settings.receipt_url_ttl_seconds` (300 s). That
+URL is a bearer credential for its lifetime: it is never stored, never logged,
+never written into the DOM, and never persisted to a draft in localStorage.
+
+**Why a public URL was wrong**, recorded so it is not reintroduced: it moved
+the authorization decision out of the application and into a string. The API's
+role checks and RLS govern the *row*; they govern the *object* not at all. An
+unguessable UUID is secrecy, not authorization — it cannot be revoked, never
+expires, and leaks through browser history, `Referer` headers, proxy logs,
+screenshots and shared links. Unlike a password it cannot be rotated without
+breaking the record that points at it.
+
+**Retention.** A receipt outlives the review edit that attached it, because
+moderation may revisit an earn_eligible decision. `review_versions.snapshot`
+records only `receipt_present` (a boolean) — the locator was stripped from all
+675 historical snapshots by migration `0023`, since both version endpoints
+serve anonymous callers for any published review.
+
+`product-images` and `review-photos` were created 2026-08-19; until then both
+upload paths failed at the storage layer, which is why review photo upload
+(BUG-023) never worked and why every product card fell through to a placeholder
+no matter what the database held. `review-receipts` followed the same day, when
+BUG-029 established that receipts had been sharing the public photo bucket.
+Each carries the size ceiling above plus `image/png,image/jpeg,image/webp`
+enforced **by the bucket as well as** by `sniff_image_type`. `avatars` predated
+that practice and had neither; both were applied on 2026-08-19 after an audit
+found application validation was the only thing enforcing its 5 MB limit. It
+held no objects and no user had an `avatar_url`, so nothing existing was
+affected — verified before the change, and normal upload plus oversize
+rejection verified after.
+
+Review photos are keyed `{uploader_id}/{uuid}.{ext}`; the larger ceiling is
+because a receipt photographed on a phone routinely clears 5 MB, and rejecting a
+valid proof of purchase is worse than storing a few extra megabytes.
+
+**Product images are seeded from a checked-in URL map, not from `source_url`.**
+No product has a genuine `source_url`: the 25 that are set all carry the
+placeholder `https://shopee.ph/x-i.1.2`, and the six on the feed have none. So
+`scripts/seed_product_images.py --from-file scripts/product_image_sources.tsv`
+reads the `og:image` from each manufacturer's own product page instead, listed
+by canonical name. Writing those URLs into `source_url` was the alternative and
+would have been false — that column means "the marketplace listing this product
+was submitted from" and feeds canonicalization.
+
+Five of the six feed products resolved on 2026-08-19 and were checked by eye,
+not merely by status code: Apple's shop page returns the current-generation Air
+in both sizes, so the M2 review takes the WWDC22 announcement image. Uniqlo
+serves a bot challenge on every path tried and falls to the moderator path,
+which is the partial success the module docstring anticipates.
+
+## Row-Level Security
+All 15 tables have RLS enabled (31 policies). Owner-write tables key on
+`auth.uid()`; public-read on content/reference tables; admin-only tables
+(`sessions`, `commissions`, `honesty_fund_distributions`, `moderation_logs`) have
+no permissive policy (service-role only). See `alembic/versions/0002_rls_policies.py`.

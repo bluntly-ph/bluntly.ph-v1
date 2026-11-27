@@ -1,0 +1,185 @@
+name: DB fast feedback
+
+# Fast, disposable feedback for DB-backed tests on feature branches.
+#
+# The canonical gate stays `CI / Backend (isolated database)`, which migrates
+# and tests against the shared `bluntly-ph-test` project. That job takes ~150
+# minutes: every query crosses to ap-southeast-1, and the shared database holds
+# every earlier run's fixtures. This job runs the same migrations and the same
+# suite against a throwaway Postgres 17 container on the runner, so a domain
+# change gets DB-backed feedback in minutes instead of hours. It never replaces
+# the canonical gate, and it needs no secrets: it cannot reach any real project.
+
+on:
+  push:
+    branches: ["feat/**", "fix/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  db:
+    name: Backend (ephemeral Postgres 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      BLUNTLY_TEST_ENV: "1"
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/ci
+      EMAIL_PROVIDER: console
+      JWT_SECRET: ci-only-secret-not-used-anywhere-else-0123456789ab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -e ".[dev]" || pip install -r requirements.txt
+      # The Supabase roles some migrations grant to or revoke from. On a real
+      # Supabase project they already exist; here they are empty stand-ins.
+      - name: Supabase role stand-ins
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d ci -v ON_ERROR_STOP=1 -c "
+            DO \$\$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='supabase_admin') THEN CREATE ROLE supabase_admin NOLOGIN; END IF;
+            END \$\$;"
+      - name: Migrate blank database to head
+        working-directory: backend
+        run: python -m alembic upgrade head
+      - name: Downgrade two steps and back (reversibility of 0050 and 0051)
+        working-directory: backend
+        run: python -m alembic downgrade -2 && python -m alembic upgrade head
+      - name: pytest (DB-backed included)
+        working-directory: backend
+        # The two receipt-storage tests need the test project's Storage key,
+        # which only the canonical isolated-database job holds.
+        run: >-
+          python -m pytest -q --maxfail=500 -p no:cacheprovider
+          --deselect tests/test_receipt_privacy.py::test_moderator_receipt_view_is_audited_without_any_locator
+          --deselect tests/test_receipt_privacy.py::test_receipt_locator_never_reaches_an_unauthorized_caller
+      # The canonical job runs the milestone verifier after pytest; running it
+      # here too means a stale milestone claim surfaces in minutes, not after a
+      # three-hour canonical run (35855491314 failed only on this stage).
+      - name: Milestone verification
+        if: always()
+        working-directory: backend
+        run: python -m scripts.verify_milestones
+      # With real rows: down to 0049 (means restored, nothing lost) and back
+      # (medians recomputed, backfills applied). Local database only — the
+      # script refuses any other host.
+      - name: Business-rules migration round trip, with data
+        if: always()
+        working-directory: backend
+        run: python -m scripts.check_rules_migration_roundtrip
+
+  journeys:
+    # Business-rule journeys in a real browser against the real stack: the
+    # production Next build, the FastAPI app and this Postgres, seeded by
+    # scripts/e2e_fixtures.py. Parallel to the DB job, so it adds no wall time
+    # to the pytest feedback. Needs no secrets: it cannot reach any real project.
+    name: Browser journeys (real API + Postgres 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      BLUNTLY_TEST_ENV: "1"
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/ci
+      EMAIL_PROVIDER: console
+      JWT_SECRET: ci-only-secret-not-used-anywhere-else-0123456789ab
+      # Every sign-in here comes from one runner IP. The QA round-2 journeys
+      # make six real code sign-ins in about a minute, over the per-IP limit of
+      # ten auth requests a minute, which then refuses the last one exactly as
+      # it would an attacker. The limiter has its own tests; lift it here only.
+      AUTH_RATE_LIMIT_MAX: "1000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -e ".[dev]" || pip install -r requirements.txt
+      - name: Supabase role stand-ins
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d ci -v ON_ERROR_STOP=1 -c "
+            DO \$\$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='supabase_admin') THEN CREATE ROLE supabase_admin NOLOGIN; END IF;
+            END \$\$;"
+      - name: Migrate and seed the journeys' starting state
+        working-directory: backend
+        run: |
+          python -m alembic upgrade head
+          python -m scripts.e2e_fixtures "$GITHUB_WORKSPACE/e2e-fixtures.json"
+      - name: Start the API
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > "$RUNNER_TEMP/api.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8000/health && break; sleep 1; done
+      - name: Build and start the site
+        env:
+          API_URL: http://127.0.0.1:8000
+        run: |
+          npm ci
+          npm run build
+          nohup npx next start -p 3000 > "$RUNNER_TEMP/web.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3000/welcome -o /dev/null && break; sleep 1; done
+      - name: Journeys
+        env:
+          E2E_FIXTURES: ${{ github.workspace }}/e2e-fixtures.json
+          E2E_API_URL: http://127.0.0.1:8000
+          # The console email provider logs each one-time code here; the QA
+          # round-2 journeys sign in through the real code flow with it.
+          E2E_API_LOG: ${{ runner.temp }}/api.log
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test e2e/br-journeys.spec.ts e2e/qa-round2-journeys.spec.ts e2e/figma-parity-journeys.spec.ts e2e/qa-round3-journeys.spec.ts e2e/qa-payments.spec.ts e2e/owner-round4-journeys.spec.ts e2e/reporting-journeys.spec.ts e2e/owner-patch-journeys.spec.ts e2e/admin-journeys.spec.ts e2e/meeting-0929-journeys.spec.ts e2e/review-queue-wilson-journeys.spec.ts --project=chromium --reporter=list
+      - name: Server logs on failure
+        if: failure()
+        run: |
+          echo "--- api"; tail -n 120 "$RUNNER_TEMP/api.log" || true
+          echo "--- web"; tail -n 60 "$RUNNER_TEMP/web.log" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: journeys-report
+          path: test-results/
+          retention-days: 7

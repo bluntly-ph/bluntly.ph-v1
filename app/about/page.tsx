@@ -1,0 +1,67 @@
+import type { Metadata } from "next";
+
+import { Article, type Block } from "@/components/site/Article";
+import { CtaLink } from "@/components/ui/CtaLink";
+import { StaticPageShell } from "@/components/site/StaticPageShell";
+
+/**
+ * Built once and served from the CDN (cost plan, 2026-10-22). "error" fails the
+ * build if anything here ever reads cookies, headers or uncached data, rather
+ * than quietly rendering every visit again: tests/frontend/static-pages.test.mjs.
+ */
+export const dynamic = "error";
+
+export const metadata: Metadata = {
+  title: "About bluntly — bluntly",
+  description:
+    "bluntly is an honest-review platform for Filipino shoppers: reviews written by real buyers, checked by administrators, and never paid for by brands.",
+};
+
+const BLOCKS: Block[] = [
+  {
+    type: "lead",
+    text: "bluntly is an honest-review platform for Filipino shoppers. The reviews are written by people who actually bought the product, checked by administrators, and never paid for by brands.",
+  },
+  { type: "h2", text: "The problem" },
+  {
+    type: "p",
+    text: "Online reviews stopped being trustworthy. Sponsored posts, incentivized ratings, and undisclosed freebies drowned out real experience. For everyday shoppers deciding whether something is worth their hard-earned money, that is more than an annoyance — it is expensive.",
+  },
+  { type: "h2", text: "What we do differently" },
+  {
+    type: "ul",
+    items: [
+      "Every review starts from a real purchase link on Shopee, Lazada, TikTok Shop, or Amazon.",
+      "An administrator reviews each submission before it is published.",
+      "Reviewers earn from affiliate commissions — and the Honesty Fund pays them for honesty, not for praise, so negative reviews are just as valuable.",
+      "No sponsorships, no paid placements, and no brand influence on verdicts.",
+    ],
+  },
+  { type: "h2", text: "Who it is for" },
+  {
+    type: "p",
+    text: "Readers who want a straight answer before they buy, and reviewers who want their honest take to be worth something. Reading is always free; writing can pay.",
+  },
+  { type: "h2", text: "Our promise" },
+  {
+    type: "p",
+    text: "Honest reviews. Real payouts. No sponsorships. No bias. Ever.",
+  },
+];
+
+export default function AboutPage() {
+  return (
+    <StaticPageShell>
+      <Article title="About bluntly" blocks={BLOCKS}>
+        <div className="mt-8 flex flex-wrap gap-3">
+          <CtaLink href="/how-it-works">
+            See how it works
+          </CtaLink>
+          <CtaLink href="/search" variant="secondary">
+            Browse reviews
+          </CtaLink>
+        </div>
+      </Article>
+    </StaticPageShell>
+  );
+}

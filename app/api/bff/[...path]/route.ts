@@ -1,0 +1,146 @@
+import { revalidateTag } from "next/cache";
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+import { API_ORIGIN } from "@/lib/api/origin";
+import { isReportDecision, tagsToExpire } from "@/lib/cache-tags";
+import {
+  BFF_ONLY_HEADERS,
+  SIGNATURE,
+  SIGNED_AT,
+  SIGNED_IP,
+  VIA_BFF,
+  edgeClientIp,
+  signClientIp,
+} from "@/lib/client-ip-signature";
+import { getSessionToken } from "@/lib/session";
+
+/**
+ * Backend-for-frontend forwarder.
+ *
+ * Client components (voting, pagination, live search) need to call the API, but
+ * they must never hold the access token. They call `/api/bff/<path>` instead and
+ * this handler attaches the credential server-side.
+ *
+ * It is a dumb pipe on purpose: no response reshaping, so the problem+json
+ * contract reaches the client untouched and `lib/api/errors.ts` still applies.
+ */
+
+/**
+ * Headers that must not be copied onto the upstream request.
+ *
+ * Hop-by-hop and length headers are per-connection. `cookie` is dropped
+ * deliberately: the backend authenticates from the Bearer token this handler
+ * attaches and has no use for the browser's cookies, so forwarding them would
+ * hand the session credential to a second system for no reason.
+ */
+const STRIPPED = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+  "cookie",
+]);
+
+async function forward(request: NextRequest, path: string[]) {
+  const token = await getSessionToken();
+  const target = `${API_ORIGIN}/${path.join("/")}${request.nextUrl.search}`;
+
+  const headers = new Headers();
+  request.headers.forEach((value, key) => {
+    if (!STRIPPED.has(key.toLowerCase())) headers.set(key, value);
+  });
+  // Never let a caller-supplied Authorization header through — the cookie is
+  // the only credential this app honours.
+  headers.delete("authorization");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  // The voter's network, for the API's vote-farming signal (QA 2026-09-29).
+  // The API sees this handler's address, not the voter's, so the address the
+  // edge reported is forwarded signed; the browser can set none of these.
+  for (const name of BFF_ONLY_HEADERS) headers.delete(name);
+  headers.set(VIA_BFF, "1");
+  const secret = process.env.CLIENT_IP_SIGNING_SECRET;
+  const clientIp = edgeClientIp(request.headers, process.env.VERCEL === "1");
+  if (secret && clientIp) {
+    const at = Math.floor(Date.now() / 1000);
+    headers.set(SIGNED_IP, clientIp);
+    headers.set(SIGNED_AT, String(at));
+    headers.set(SIGNATURE, signClientIp(clientIp, at, secret));
+  }
+
+  const hasBody = !["GET", "HEAD"].includes(request.method);
+
+  let response: Response;
+  try {
+    response = await fetch(target, {
+      method: request.method,
+      headers,
+      body: hasBody ? await request.arrayBuffer() : undefined,
+      cache: "no-store",
+      redirect: "manual",
+    });
+  } catch {
+    return NextResponse.json(
+      {
+        type: "about:blank",
+        title: "Backend unreachable",
+        status: 503,
+        detail: "Could not reach the API.",
+        instance: `/${path.join("/")}`,
+        code: "backend_unreachable",
+      },
+      { status: 503, headers: { "content-type": "application/problem+json" } },
+    );
+  }
+
+  // A successful write to a review expires that review's cached public reads
+  // and the card lists, before the caller gets its answer — so the next page
+  // anyone loads shows the committed count instead of a minute-old one. See
+  // lib/cache-tags.ts. `{ expire: 0 }`, not "max": "max" serves the stale
+  // entry once more, which is exactly the stale count being fixed.
+  if (response.ok && hasBody) {
+    const joined = path.join("/");
+    let reported: string | null = null;
+    if (isReportDecision(joined)) {
+      const decided = (await response
+        .clone()
+        .json()
+        .catch(() => null)) as { target?: { id?: string } | null } | null;
+      reported = decided?.target?.id ?? null;
+    }
+    for (const tag of tagsToExpire(request.method, joined, reported)) {
+      revalidateTag(tag, { expire: 0 });
+    }
+  }
+
+  const outHeaders = new Headers(response.headers);
+  outHeaders.delete("content-encoding");
+  outHeaders.delete("content-length");
+
+  return new NextResponse(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: outHeaders,
+  });
+}
+
+type Context = { params: Promise<{ path: string[] }> };
+
+export async function GET(request: NextRequest, ctx: Context) {
+  return forward(request, (await ctx.params).path);
+}
+export async function POST(request: NextRequest, ctx: Context) {
+  return forward(request, (await ctx.params).path);
+}
+export async function PATCH(request: NextRequest, ctx: Context) {
+  return forward(request, (await ctx.params).path);
+}
+export async function PUT(request: NextRequest, ctx: Context) {
+  return forward(request, (await ctx.params).path);
+}
+export async function DELETE(request: NextRequest, ctx: Context) {
+  return forward(request, (await ctx.params).path);
+}

@@ -1,0 +1,69 @@
+{
+  "account": "perezgyber@gmail.com",
+  "period": "2026-04-05 to 2026-10-02 (completed orders)",
+  "gross_sales": 65969.0,
+  "orders": 91,
+  "items": 123,
+  "gross_commission": 1962.7,
+  "reversals": 0.0,
+  "cancelled_items": 3,
+  "refunded_items": 5,
+  "net_commission": 1962.7,
+  "split": {
+    "reviewer_30": 588.81,
+    "honesty_fund_30": 588.81,
+    "bluntly_40": 785.08
+  },
+  "pending": {
+    "net_commission": 109.95,
+    "orders": 8
+  },
+  "by_marketplace": {
+    "Shopee": {
+      "gross_commission": 1962.7,
+      "orders": 91
+    },
+    "Lazada": {
+      "gross_commission": 0,
+      "orders": 0
+    }
+  },
+  "top_products": [
+    {
+      "item_id": "23743555988",
+      "name": "JISULIFE Handheld Fan Pro1/Pro1S Mini Fan Rechargeable Jet Fan Strong Wind 100 Gear Wind Speed Metal Body Digital Display Adjust",
+      "sales": 3873.0,
+      "net_commission": 250.01,
+      "orders": 3
+    },
+    {
+      "item_id": "22836255418",
+      "name": "Edifier W820NB Plus Wireless Bluetooth Noise Cancelling/Edifier  W820NB Plus 2025 Version",
+      "sales": 2580.0,
+      "net_commission": 246.4,
+      "orders": 1
+    },
+    {
+      "item_id": "17552845260",
+      "name": "【24-Month Warranty】Baseus Bowie WM02/WM02s TWS Bluetooth Earphones Stereo Wireless 5.3/Wireless 6.0",
+      "sales": 2139.0,
+      "net_commission": 192.51,
+      "orders": 3
+    },
+    {
+      "item_id": "851073401",
+      "name": "Imarflex 3 in 1 Blend to Go IB-250P",
+      "sales": 1666.0,
+      "net_commission": 123.3,
+      "orders": 1
+    },
+    {
+      "item_id": "16998608895",
+      "name": "JISULIFE Handheld Fan Ultra1 3 in 1 Portable Turbo Jet Fan Rechargeable With Air Duster Function Mini Fan With 1-100 Speeds LED ",
+      "sales": 2220.0,
+      "net_commission": 84.4,
+      "orders": 1
+    }
+  ],
+  "product_count": 109
+}

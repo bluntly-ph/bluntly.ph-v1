@@ -1,0 +1,84 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# python backend
+backend/.venv/
+__pycache__/
+*.pyc
+backend/.pytest_cache/
+backend/.ruff_cache/
+.python-version
+
+# local server logs
+*.log
+
+.vercel
+.env*
+
+# playwright mcp — screenshots, traces, downloads from verification runs
+.playwright-mcp/
+
+# playwright test runner
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+# Local isolated feature worktrees.
+/.worktrees/
+
+# Service account keys and other credentials. Nothing in this repo should ever
+# hold one — they live outside the working tree and are referenced by env var —
+# but a stray download into the project should be refused, not staged.
+*-sa.json
+*service-account*.json
+*credentials*.json
+
+# Env templates carry no secrets and are the only record of which variables an
+# environment needs. These negations must stay LAST: `.env*` appears twice
+# above, and a later ignore rule overrides an earlier negation.
+!.env.example
+!backend/.env.test.example
+
+# performance lab output (scripts/perf) — raw Lighthouse reports, kept locally
+/.perf/
+/.qa/

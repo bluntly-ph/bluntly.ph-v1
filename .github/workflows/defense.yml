@@ -1,0 +1,204 @@
+name: Defense environment
+
+# The capstone defense runs on bluntly-ph-test, filled with the defense dataset
+# (backend/scripts/defense). Two jobs:
+#
+#   rehearsal      The whole presentation, on its OWN throwaway database: seed,
+#                  readiness check, then the walkthrough in a real browser with
+#                  real sign-ins, photographed at phone and desktop width. No
+#                  secrets; it cannot reach any real project. Runs on every PR
+#                  that touches the defense tooling, and on demand.
+#
+#   populate-test  Clears bluntly-ph-test and seeds the defense dataset there,
+#                  then runs the readiness check against it. Manual (tick
+#                  "populate_test"), or automatic after CI on main when the
+#                  repository variable DEFENSE_AUTOSEED is "true" - CI's
+#                  isolated-database job writes test fixtures into the same
+#                  project, and this puts the defense data back afterwards.
+#                  Never production: the scripts refuse anything but
+#                  bluntly-ph-test, and the workflow only ever hands them the
+#                  TEST_* secrets.
+#
+# The persona accounts sign in by emailed code, sent to "+" aliases of the
+# team's inbox: the optional DEFENSE_EMAIL_BASE secret, else the root owner's
+# address from app config. No password or code is ever stored anywhere.
+
+on:
+  workflow_dispatch:
+    inputs:
+      populate_test:
+        description: "Reset bluntly-ph-test and seed the defense dataset there"
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  pull_request:
+    paths:
+      - "backend/scripts/defense/**"
+      - "e2e/defense-walkthrough.spec.ts"
+      - ".github/workflows/defense.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rehearsal:
+    name: Walkthrough rehearsal (own Postgres 17)
+    if: ${{ github.event_name != 'workflow_run' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: defense
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d defense"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      BLUNTLY_TEST_ENV: "1"
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/defense
+      EMAIL_PROVIDER: console
+      JWT_SECRET: ci-only-secret-not-used-anywhere-else-0123456789ab
+      # Six personas sign in by code from one runner IP within a few minutes.
+      AUTH_RATE_LIMIT_MAX: "1000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -e ".[dev]" || pip install -r requirements.txt
+      - name: Supabase role stand-ins
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d defense -v ON_ERROR_STOP=1 -c "
+            DO \$\$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='supabase_admin') THEN CREATE ROLE supabase_admin NOLOGIN; END IF;
+            END \$\$;"
+      - name: Migrate, seed the defense dataset, check it is ready
+        working-directory: backend
+        run: |
+          python -m alembic upgrade head
+          python -m scripts.defense.seed --email-base rehearsal@demo.bluntly.ph \
+            --out "$RUNNER_TEMP/defense-seed.json" --image-cache "$RUNNER_TEMP/defense-images"
+          python -m scripts.defense.verify --json "$RUNNER_TEMP/defense-verify.json"
+      - name: Start the API
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > "$RUNNER_TEMP/api.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8000/health && break; sleep 1; done
+      - name: Build and start the site
+        env:
+          API_URL: http://127.0.0.1:8000
+        run: |
+          npm ci
+          npm run build
+          nohup npx next start -p 3000 > "$RUNNER_TEMP/web.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3000/welcome -o /dev/null && break; sleep 1; done
+      - name: Walkthrough
+        env:
+          DEFENSE_SEED: ${{ runner.temp }}/defense-seed.json
+          DEFENSE_IMAGES: ${{ runner.temp }}/defense-images
+          E2E_API_URL: http://127.0.0.1:8000
+          E2E_API_LOG: ${{ runner.temp }}/api.log
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test e2e/defense-walkthrough.spec.ts --project=chromium --reporter=list
+      - name: Server logs on failure
+        if: failure()
+        run: |
+          echo "--- api"; tail -n 120 "$RUNNER_TEMP/api.log" || true
+          echo "--- web"; tail -n 60 "$RUNNER_TEMP/web.log" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: defense-walkthrough
+          path: |
+            test-results/
+            ${{ runner.temp }}/defense-verify.json
+          retention-days: 14
+
+  populate-test:
+    name: Seed bluntly-ph-test with the defense dataset
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && inputs.populate_test) ||
+          (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+           vars.DEFENSE_AUTOSEED == 'true') }}
+    runs-on: ubuntu-latest
+    # Measured, not guessed: from a GitHub runner every query crosses to
+    # ap-southeast-1, and the first run needed 15 minutes for the first four
+    # seed steps that take 20 seconds locally (~45x). The full seed and check
+    # come to roughly 90 minutes that way, past the first limit of 60. Bounded
+    # so a genuine hang is still caught (see ci.yml's isolated-database job).
+    timeout-minutes: 180
+    # One writer at a time on the shared project: CI's isolated-database job
+    # holds the same group.
+    concurrency:
+      group: bluntly-ph-test
+      cancel-in-progress: false
+    env:
+      BLUNTLY_TEST_ENV: "1"
+      APP_ENV: test
+      USE_SUPABASE: "true"
+      SUPABASE_URL: ${{ secrets.TEST_SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.TEST_SUPABASE_SECRET_KEY }}
+      SUPABASE_CONNECTION_STRING_SESSION_POOLER: ${{ secrets.TEST_SUPABASE_SESSION_POOLER }}
+      DEFENSE_EMAIL_BASE: ${{ secrets.DEFENSE_EMAIL_BASE }}
+      EMAIL_PROVIDER: console
+      JWT_SECRET: ci-only-secret-not-used-anywhere-else-0123456789ab
+      # The session pooler allows only a handful of clients (see ci.yml).
+      DB_POOL_SIZE: "2"
+      DB_MAX_OVERFLOW: "3"
+      DB_POOL_TIMEOUT: "30"
+    steps:
+      - name: Require the TEST credentials
+        run: |
+          missing=""
+          [ -n "$SUPABASE_CONNECTION_STRING_SESSION_POOLER" ] || missing="$missing TEST_SUPABASE_SESSION_POOLER"
+          [ -n "$SUPABASE_URL" ] || missing="$missing TEST_SUPABASE_URL"
+          [ -n "$SUPABASE_SECRET_KEY" ] || missing="$missing TEST_SUPABASE_SECRET_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Repository secrets not set:$missing"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          # After CI, seed exactly the commit CI tested.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -e ".[dev]" || pip install -r requirements.txt
+      - name: Migrate, reset, seed, and check readiness
+        working-directory: backend
+        run: |
+          python -m alembic upgrade head
+          python -m scripts.defense.reset
+          python -m scripts.defense.reset --apply
+          python -m scripts.defense.seed --out "$RUNNER_TEMP/defense-seed.json"
+          python -m scripts.defense.verify --json "$RUNNER_TEMP/defense-verify.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          # Account ids and usernames only; the addresses are "+" aliases of the
+          # team inbox, which the repository secret already holds.
+          name: defense-test-readiness
+          path: ${{ runner.temp }}/defense-verify.json
+          retention-days: 30

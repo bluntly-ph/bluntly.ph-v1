@@ -1,0 +1,107 @@
+[project]
+name = "bluntly-ph-backend"
+version = "0.1.0"
+description = "Bluntly.ph FastAPI backend — verified product & seller review platform"
+requires-python = ">=3.12"
+readme = "README.md"
+
+# The single source of runtime dependencies.
+#
+# This used to live in requirements.txt while `[project]` carried no
+# `dependencies` key at all. That is fine for pip, and silently fatal on
+# Vercel: its Python runtime treats `[project]` as the manifest, found nothing
+# to install, and shipped a function whose very first import failed
+# (ModuleNotFoundError: anyio). Keeping the list here means the platform and
+# the Dockerfile install the same set.
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.35",
+    "sqlalchemy>=2.0,<2.1",
+    "alembic>=1.13,<1.15",
+    "psycopg[binary]>=3.2,<3.3",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.5,<3.0",
+    "pyjwt[crypto]>=2.9,<2.11",
+    "cryptography>=43.0",
+    "httpx>=0.27,<0.29",
+    "redis>=5.0,<6.0",
+    "celery>=5.4,<5.6",
+    "python-multipart>=0.0.12",
+    "supabase>=2.9,<3.0",
+    "argon2-cffi>=23.1",
+    "anthropic>=0.40",
+    "email-validator>=2.2",
+    # Contract term arithmetic (M3 slice 10): relativedelta clamps month-end
+    # dates correctly (Jan 31 + 1 month -> Feb 28/29). Present transitively via
+    # celery, but contracts depend on it directly — declare it so a celery
+    # change cannot drop it.
+    "python-dateutil>=2.9",
+    # Review photos are decoded at upload (corrupt files and decompression
+    # bombs are refused) and fingerprinted for the reused-photo check
+    # (QA 2026-09-29, services/image_fingerprint.py).
+    "pillow>=10.4,<13",
+    # The financial report's branded PDF (Reports -> Generate report, meeting
+    # 2026-10-02): drawn with ReportLab's canvas. BSD licence; pure Python.
+    "reportlab>=4.2,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.7", "locust>=2.31", "matplotlib>=3.9"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Not a distributable library — the app is copied in whole. Declaring the
+# package list explicitly stops setuptools auto-discovery from tripping over
+# `tests/`, `scripts/` and `alembic/`.
+packages = ["app"]
+
+[tool.setuptools.package-data]
+# The financial report PDF's fonts and wordmark (app/assets/report/README.md).
+app = ["assets/report/*"]
+
+[tool.vercel]
+# Where the ASGI app lives, in module:object form.
+entrypoint = "app.main:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# ASYNC and PLE were added after a NameError reached production in a code path
+# whose every test is `requires_db` and skips without a Postgres. With the
+# integration half of the suite unavailable, static analysis is most of what
+# stands between an edit and production, so the rules that find *runtime faults*
+# earn their place:
+#   ASYNC — blocking calls inside async functions. This app mixes sync route
+#           handlers with async middleware, which is where that goes wrong.
+#   PLE   — pylint's error subset only: used-before-assignment, bad call
+#           arity, await outside async. Not its style opinions.
+#
+# Both reported zero when added, so neither costs a cleanup. The noisy families
+# were measured and declined on purpose: S is 1103 findings (mostly `assert` in
+# tests, which is what tests are for), T20 is 186 (the scripts are meant to
+# print), RUF 92, PTH 14.
+select = ["E", "F", "I", "UP", "B", "ASYNC", "PLE"]
+# B008: FastAPI Depends() in defaults is idiomatic.
+# UP042: we intentionally use (str, Enum) mixins, not StrEnum, for value serialization.
+ignore = ["B008", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+# Manual smoke-test tool: a linear assertion checklist where long lines read fine.
+"scripts/api_smoke.py" = ["E501"]
+# Seed data: the long lines are review/answer prose inside SQL literals. Wrapping
+# them would split sentences mid-clause to satisfy a limit meant for code.
+"scripts/reset_and_seed.py" = ["E501"]
+# Fixture cleanup: each long line is one (table, SQL) pair. Wrapping them breaks
+# the SQL mid-clause and makes the export and delete lists harder to read
+# against each other, which is the one thing that must stay easy to check.
+"scripts/cleanup_fixtures.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]

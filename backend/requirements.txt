@@ -1,0 +1,10 @@
+# Runtime dependencies now live in pyproject.toml, under [project].dependencies.
+#
+# One manifest, so pip, Docker and Vercel install exactly the same set. They used
+# to be listed here while pyproject carried a `[project]` table with no
+# `dependencies` key — fine for pip, and silently fatal on Vercel, which reads
+# pyproject as the manifest, installed nothing, and shipped a function that died
+# on its first import.
+#
+# This file stays so `pip install -r requirements.txt` keeps working.
+.

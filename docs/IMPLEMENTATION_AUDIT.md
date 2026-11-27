@@ -1,0 +1,355 @@
+# Implementation audit — surfaces against their approved Figma frames
+
+**Prepared 2026-08-26.** Figma file `lso4Ri4hDaZxvCebhUqlY5`.
+
+This is the classification the owner asked for: every surface judged against the
+approved frame that exists for it, rather than against a general impression of
+whether it looks reasonable.
+
+## How to read this
+
+| Classification | Meaning |
+|---|---|
+| `FIGMA_1_TO_1` | Built to the frame; differences are sub-pixel or invisible at the frame's own viewport. |
+| `MINOR_FIDELITY_GAP` | Recognisably the frame, with specific measurable differences listed. |
+| `MAJOR_FIDELITY_GAP` | Different structure or information architecture. Spacing work would not close it. |
+| `NO_CURRENT_FIGMA` | No approved frame exists. Built to the design system instead. |
+| `SUPERSEDED_BY_OWNER_DECISION` | A frame exists and was deliberately departed from, with the decision recorded. |
+
+**A visual claim requires visual evidence.** Where a surface has not been
+rendered and compared, this document says so rather than inferring fidelity
+from the source. That distinction is the point of the audit.
+
+---
+
+## Surfaces
+
+| Surface | Frame | Classification | Visual evidence |
+|---|---|---|---|
+| `/` landing | `1902:1504` | `FIGMA_1_TO_1` | Screenshot-compared at 390/768/1440 in the earlier sprint. |
+| `/reviews/[id]` | `4218:1196` | `SUPERSEDED_BY_OWNER_DECISION` | The frame is a phone layout; the owner approved a desktop redesign (site header + 20rem context sidebar from `lg`). Mobile is unchanged and matches. |
+| `/feed` | `NO_CURRENT_FIGMA` | — | New surface approved after the frames were drawn. Built from the design system; verified responsive 320–1920. |
+| `/dashboard` | `5572:7130` | **Built to frame; visual comparison OUTSTANDING** | Rendered component-by-component against fixture data at 390/768/1440 with zero console errors and no horizontal overflow. **Not yet rendered behind a real login** — see *Outstanding* below. |
+| `/moderate` | `5017:1738` | **Built to frame; visual comparison OUTSTANDING** | Same as above, at 1280/768/390. Was `MAJOR_FIDELITY_GAP` before this sprint: the frame is a sidebar console and the page was a single scrolling list. |
+| Request Distribution (within `/moderate`) | Owner-supplied reference | `NO_CURRENT_FIGMA` | No Figma frame; built to the reference's information architecture in Bluntly's own design language, deliberately not Vercel's. Rendered and verified in all four states at 390/768/1440. |
+| `/login`, `/signup`, `/welcome` | `5357:2982` | `FIGMA_1_TO_1` | Verified in the earlier sprint. |
+| `/search`, `/categories`, `/questions`, `/requests` | `NO_CURRENT_FIGMA` | — | Built from the design system. |
+
+---
+
+## Documented deviations
+
+Each is a deliberate departure from an approved frame, with the reason and what
+would close it.
+
+### Avg. Read time — `/dashboard`
+
+| | |
+|---|---|
+| **Figma** | A third stat reading "4m 3s". |
+| **Implementation** | `—`, labelled "Not measured yet". |
+| **Why** | Nothing measures read time. Producing it means timing how long a reader stays on a page, which is reader-behaviour tracking rather than the aggregate counting used everywhere else here, and it needs a privacy ruling that is the owner's to make. |
+| **What would close it** | Either (a) an owner decision permitting reader-session timing, plus a privacy-policy line; or (b) a switch to **estimated reading time derived from content length**, which needs no tracking at all — but it must then be labelled *estimated reading time*, never *average read time*. The two are different claims and must not be conflated. |
+| **API shape** | Returns `null` and names the field in `unavailable[]`, so the client renders the tile honestly rather than substituting a plausible number. |
+
+### Unbuilt administrative destinations — `/moderate`
+
+| | |
+|---|---|
+| **Figma** | Ten navigation items, rendered identically. |
+| **Implementation** | The three with a real destination link. The other seven keep their position and label, marked "Soon", and are not focusable. |
+| **Why** | Products, Sellers, Reviewers, Affiliate Links, Honesty Fund, Activity Log and Settings have no page behind them. Shipping them as live links would put seven dead controls in an admin tool's primary navigation. |
+| **What would close it** | Build the seven screens, or an owner ruling that they are out of scope for this release. |
+
+---
+
+## The reviewer dashboard flow (2026-08-27)
+
+The five approved frames are a flow, and `/dashboard` was only its entry screen.
+**Correcting an earlier misclassification of mine:** I recorded all four
+remaining frames as new product scope. That was wrong. Wallet, the ₱300
+threshold, payout requests, payment history and review/profile are already
+signed requirements, so these frames are Figma presentations of existing
+functionality. Only the streak is a new question.
+
+| Frame | Screen | Classification | State |
+|---|---|---|---|
+| `5572:7130` | Reviewer Dashboard | original functionality / Figma implementation | Built |
+| `5762:332` | Transfer | original functionality / Figma implementation | **Built** — real wallet, ₱300 threshold, existing payout APIs |
+| `5762:472` | History | original functionality / Figma implementation | **Built** — canonical ledger, 40/30/30 split |
+| `6159:1510` | Reviews | original functionality / Figma implementation | **Built** — see the frame note below |
+| `5762:752` | Insights | partial original analytics UI | **Built except the streak** |
+| — | Reading-streak telemetry | `OWNER DECISION` | Not built |
+
+### Transfer — `5762:332`
+
+Renders the real wallet, never the frame's ₱328.04 sample. Below ₱300 the
+`Request Withdrawal` control is disabled with the shortfall stated, rather than
+hidden — the frame has the control, and a reviewer needs to see that withdrawal
+exists and why it is not open yet. The frame's sheet below the button is empty,
+so it carries the threshold progress and payout account: the functionality the
+button needs in order to be honest. Live PayPal remains `BLOCKED EXTERNAL`; the
+screen is complete up to that provider boundary.
+
+### History — `5762:472`
+
+The best-specified frame in the set, and it maps onto the canonical ledger
+without translation: Price, Comm. %, and the split as Bluntly / Honesty Fund /
+Yours are `gross_amount`, the recorded provider rate, and the three share
+columns.
+
+Its tabs are the reviewer-facing reading of the canonical pair, and the mapping
+is written down rather than inferred:
+
+| Tab | Means |
+|---|---|
+| Pending | the marketplace has not finalised the sale |
+| To earn | recognised and owed, **not** yet paid |
+| Paid | settled into a payout |
+| Returned | reversed |
+
+`To earn` is deliberately not "Completed". A completed sale that has not been
+paid is exactly the distinction a reviewer needs, and "Completed" hides it. A
+return that lands *after* payout reads as `Returned`, not `Paid`. Reversal
+entries are never listed as rows of their own.
+
+### Reviews — `6159:1510`
+
+**The frame specifies chrome and nothing else.** Its only children are the hero
+rectangle, the white sheet and the nav bar — no list, no cards, no empty state.
+So the chrome is reproduced exactly and the content is the reviewer's existing
+data in the design system, because there is no composition in Figma to build
+to. If one is added later, this screen should be rebuilt to it.
+
+### Measured against the frames (2026-08-27)
+
+The frames were measured rather than read, by rendering each one and scanning
+for the white sheet's top edge. **Scan at the left margin, not the centre**: on
+Transfer, History and Insights the centre column hits a floating white card and
+reports the sheet ~90px higher than it is.
+
+Four defects came out of it, none of which needed a browser:
+
+| Defect | Was | Now |
+|---|---|---|
+| History `Earned` rendered the price | `gross_amount` twice per row | sum of the three shares |
+| Transfer hero | 510 | 401 (sheet 369px below the nav) |
+| History hero | 300 | 208 (sheet 176px) |
+| Reviews hero | 417 | 118 (sheet 86px — the hero *is* the nav row) |
+| Insights chrome | shared back-arrow nav | `SiteHeader`, per the frame |
+| History tabs | five | the four the frame draws |
+
+The money one is the one that mattered. The expanded History row rendered
+`gross_amount` for both Price and Earned, so every row printed its price twice.
+The frame reads Price ₱1000 / Comm. % 10% / **Earned ₱100** — Earned is the
+commission, the three shares added up. `sumPeso` sums in centavos rather than
+as floats, because the shares are rounded independently when they are written.
+
+Insights was not a gap so much as the wrong screen: it had been built on the
+shared dashboard chrome, and frame 5762:752 does not use it. It uses the
+ordinary site header — wordmark, search, avatar — over a shallow gradient, with
+the Streak block and chart directly on white, no cards and no stats strip.
+
+Two claims that had rested on Figma metadata were re-checked against rendered
+pixels and both held: frame 6159:1510 really is chrome and nothing else, and
+`/moderate`'s four Queue Breakdown labels (Earn Eligible, Flagged, New Product,
+First Submission) are emitted by the backend exactly as the frame draws them.
+
+**This is not visual acceptance.** Geometry measured off a design file and
+source read in a repository are not a rendered page. `1:1` is not claimed for
+any screen until the authenticated pass below has run.
+
+### CI closure — run 33007431944, all four jobs green
+
+| Job | Result |
+|---|---|
+| Production guard | success (18 passed) |
+| Backend (no database) | success (727 passed, 178 skipped) |
+| Frontend | success |
+| Backend (isolated database) | success — **905 passed, 0 failed, 2:06:11** |
+
+The isolated-database job was previously reported as a permanent blocker. It is
+not: it takes **126 minutes**, so the original 75-minute timeout and the later
+120-minute one both cut it off mid-run. At 150 it completes.
+
+**That leaves only 24 minutes of headroom, and it will run out.** The job grows
+with the suite. When it next times out the answer is not another arbitrary bump
+— it is to shard the job or cut the per-test database setup cost, and the
+measured 126 minutes is the baseline to compare any such work against.
+
+Two earlier runs of this same code (33004509578, 33006482249) show `cancelled`
+and were misread as infrastructure trouble. They were not: the workflow sets
+`cancel-in-progress`, and each was killed by the next push — including pushes of
+mine. A run of a two-hour job only survives if nothing lands on the branch
+while it works.
+
+### Authenticated visual acceptance — still outstanding
+
+`.visual-acceptance.mjs` captures all six screens at 1440/1280/1024/768/393 and
+refuses to run against an expired session, so it cannot quietly photograph a
+login page. It needs a session, and the session needs one human OTP entry:
+`.auth-capture.mjs` opens a real browser, fills the address, requests the code,
+and waits for a person to type it. Nothing mints a token or weakens a guard.
+
+*(That script had a bug worth recording: it filled the email field and then
+waited for a code it had never asked for, because it never clicked "Send code".
+Two capture attempts were reported as the account holder being unavailable when
+no email had been sent at all. Fixed.)*
+
+### The four dashboard frames are 390px
+
+All four are drawn at 390 wide; only `/moderate` is drawn at 1280. Comparing a
+390px design at 1440 is a category error, which is what `max-w-[430px]` on the
+screen container exists to resolve — the frame's composition is the mobile one,
+and the wide viewports get the same composition centred, not a redesign.
+
+### Insights — `5762:752`, and the streak question
+
+Elements split before anything was written:
+
+| Element | Class | State |
+|---|---|---|
+| Dated area chart | `EXISTING_DATA` | Built — daily views, labelled explicitly |
+| Views, people helped, reviews, earnings | `EXISTING_DATA` | Built |
+| Streak: flame, "6 days", month dot-grid | `REQUIRES_NEW_BEHAVIORAL_TELEMETRY` *or* `DERIVABLE_WITHOUT_TRACKING` — **ambiguous** | Not built |
+
+The chart is labelled "Daily views" because the frame's series is unlabelled,
+and an unlabelled money-or-traffic curve on an earnings product gets misread.
+
+**The open question, and the only thing blocking this screen:**
+
+> Does the Insights streak count days the reviewer **contributed** (published a
+> review, question or answer), or days they **read/browsed** Bluntly?
+
+It matters because the two are different products. A contribution streak is
+derivable today from data already persisted and needs no tracking at all. A
+reading streak requires reader-session telemetry that does not exist and would
+need a privacy ruling, in the same class as *Avg. Read time*.
+
+Picking the convenient reading would be silently redefining a designed feature
+to make it implementable, so the card ships saying it is not available yet and
+why. It is **not** populated with placeholder days.
+
+---
+
+## Outstanding — authenticated visual comparison
+
+`/dashboard` and `/moderate` have **not** been rendered end-to-end behind a real
+moderator login by engineering. What has been done:
+
+* every component rendered against fixture data at each required viewport, with
+  zero console errors and no horizontal overflow;
+* every backing API exercised against production data;
+* server-side authorization verified (both routes 307 to `/login?next=…`, every
+  new endpoint 401s anonymously).
+
+That is **not** acceptance evidence for a 1:1 claim, and this document does not
+make one. The blocker is the browser channel: Claude's Chrome extension reports
+no connected browser, and engineering will not mint a production token or
+weaken a guard to work around it.
+
+**To close:** connect the browser channel to the already signed-in
+`bluntly.ph@gmail.com` moderator session, then compare both pages against their
+frames at 1440 / 1280 / 1024 / 768 / 393 with screenshot evidence.
+
+---
+
+## Dashboard data integrity
+
+The dashboard's figures are required to reconcile against the canonical
+affiliate system, and the two axes must never be conflated:
+
+```
+lifecycle   Pending | Completed | Cancelled | Returned     (what the marketplace says)
+settlement  not_earned | earned | paid | reversed          (what our ledger did)
+```
+
+They are stored, served and rendered separately, and the admin console shows
+them as two independent groups rather than one combined bar. This is not
+cosmetic: a `completed` order can be `not_earned` when no review can be
+attributed to it, and a `returned` one can be `paid` — that is exactly the
+post-payout case the platform absorbs. A single progression bar would assert a
+relationship that does not exist, and would visually imply `Completed = paid`.
+
+The reviewer dashboard's headline is **net** recognised commission: reversal
+entries are included in the sum rather than filtered out, so a returned sale
+reduces the figure instead of leaving a reviewer looking at money they no
+longer have.
+
+## Release 86a434a — engineering complete, ready for independent QA retest
+
+POST-RELEASE DOCUMENTATION ONLY. NO APPLICATION CHANGE. RELEASE SHA REMAINS 86a434a.
+
+    Engineering release SHA   86a434a
+    CI run                    33070952642 — all four jobs green
+    Isolated database         953 passed, 0 failed, 2:14:41
+    Backend (no database)     766 passed, 187 skipped
+    Production guard          18 passed
+    Deployed revision         86a434a (deployment 6122453125)
+    Alembic head              0033_review_view_buckets — code-only release
+    Authenticated acceptance  6 screens x 5 viewports, 30/30 clean
+    Public smoke              8/8 clean
+
+Evidence converges on one revision. CI, the deployed application, the visual
+acceptance and the QA handoff all name 86a434a; nothing is combined across
+commits.
+
+### Confirmed root cause — admin Overview production 500
+
+    Caused by a UUID/string boundary mismatch in ActivityItem.target_ref.
+
+`moderation_logs.target_ref` is a UUID column. `ActivityItem` and
+`ActivityItemOut` both declare `str | None`, and Pydantic v2 does not coerce
+UUID to str. The construction sits in the route's return statement, outside
+both service guards, which is why guarding them changed nothing and why local
+reproduction kept passing — every fake used a string, because the dataclass
+said it was one.
+
+### Related latent defect, fixed in the same change
+
+    Reported-review UUIDs were compared against string queue IDs, preventing
+    Flagged / high-priority classification from ever being non-zero.
+
+### Eliminated hypotheses — none contributed
+
+Missing `Decimal` import (the line was introduced by the later fix itself, so
+it cannot explain a 500 that predates it), route shadowing, enum drift,
+schema/column drift, timezone/tzdata, response-model mismatch, function
+timeout, failing SQL, stale deployment, session teardown, platform failure.
+
+### Why it survived 905 green tests
+
+The endpoint had no route-level coverage against a real database. Coverage
+count was the misleading signal.
+
+### Non-blocking engineering follow-up
+
+    COVERAGE_FOLLOWUP  Add an isolated-DB/API regression test inserting a
+                       reported review by UUID and verifying the matching
+                       queued review contributes to Flagged / high-priority
+                       state; unrelated UUIDs must not match; duplicate
+                       reports must not multiply unique flagged reviews.
+                       The identifier mismatch itself is already guarded.
+
+    DEPLOY_PIPELINE    Vercel deploys production on push, before CI finishes.
+                       A documentation-only commit would replace the accepted
+                       revision. Target: push -> CI -> approval -> deploy of
+                       the exact green SHA.
+
+    CI_RUNTIME         Isolated-DB job at 2:14:41 against a 150-minute cap.
+                       ~15 minutes of headroom. Shard or cut per-test setup
+                       when it next times out; do not raise the cap again.
+
+Neither is a product defect and neither is QA work.
+
+### External — unchanged
+
+    PAYPAL_SANDBOX   BLOCKED_EXTERNAL — Zient
+    AVG_READ_TIME    OWNER/PRIVACY DECISION (not the same as an estimated
+                     reading time computed from word count)
+    QA_SIGNOFF       BLOCKED_EXTERNAL — Independent QA
+
+Status: ENGINEERING COMPLETE / DEPLOYED TO AUTHORIZED PRODUCTION DEV/QA
+ENVIRONMENT / READY FOR INDEPENDENT QA RETEST. Never QA PASSED — only the
+independent QA team can close that.
+

@@ -1,0 +1,377 @@
+"""Read-only integrity check: does the data still satisfy what the code assumes?
+
+Every query here is a SELECT with a count. It writes nothing, creates nothing,
+and is therefore the one check in this repository that is safe to point at
+production - which is the point, because production is the only place the data
+is real.
+
+The invariants are the ones the application states in prose and then relies on:
+
+  * `payout_service`: "wallet == inflows - SUM(payouts in scheduled/processing/paid)".
+  * `referral_service`: only a verified review can be monetized, and never one
+    at two stars or below (the `rev_show_` fixture namespace is exempted from
+    the first half, and a paired check forbids those fixtures from claiming
+    verification - see the two entries below).
+  * `earnings`: the three commission shares sum to the gross, and none is
+    negative.
+  * The foreign keys, restated as orphan counts - a FK can be dropped by a
+    migration and nothing else would notice.
+
+Usage:
+    cd backend && python -m scripts.check_invariants
+    cd backend && python -m scripts.check_invariants --strict   # exit 1 on any violation
+"""
+
+from __future__ import annotations
+
+import argparse
+
+from sqlalchemy import text
+
+# (name, SQL returning one integer, what a non-zero result means)
+CHECKS: tuple[tuple[str, str, str], ...] = (
+    ("negative wallet balances",
+     "SELECT count(*) FROM users WHERE wallet_balance < 0",
+     "A wallet went below zero. ck_user_wallet_non_negative should make this "
+     "impossible; if it fires, the constraint was dropped."),
+
+    ("reviews with no author",
+     "SELECT count(*) FROM reviews r LEFT JOIN users u ON u.id = r.author_id "
+     "WHERE u.id IS NULL",
+     "Orphaned reviews. The author FK is gone or was never enforced."),
+
+    ("reviews with no product",
+     "SELECT count(*) FROM reviews r LEFT JOIN products p ON p.id = r.product_id "
+     "WHERE p.id IS NULL",
+     "Orphaned reviews; the product they describe no longer exists."),
+
+    ("payouts with no user",
+     "SELECT count(*) FROM payouts p LEFT JOIN users u ON u.id = p.user_id "
+     "WHERE u.id IS NULL",
+     "Money owed to nobody."),
+
+    ("commissions pointing at a missing review",
+     "SELECT count(*) FROM commissions c LEFT JOIN reviews r ON r.id = c.review_id "
+     "WHERE c.review_id IS NOT NULL AND r.id IS NULL",
+     "Earnings attributed to a review that is gone."),
+
+    ("reviews with two active referral links",
+     "SELECT count(*) FROM (SELECT review_id FROM referral_links "
+     "WHERE status = 'active' GROUP BY review_id HAVING count(*) > 1) x",
+     "referral_service refuses a second active link; two means it was "
+     "bypassed, and attribution is now ambiguous."),
+
+    ("star ratings out of range",
+     "SELECT count(*) FROM reviews WHERE NOT (star_rating >= 0 AND star_rating <= 5 "
+     "AND star_rating * 2 = trunc(star_rating * 2))",
+     "Feeds avg_rating and the Wilson ranking, so one bad row skews the "
+     "ordering the whole platform is built on. The rule is ck_review_star_rating "
+     "since 0048: 0 to 5 in half stars (this check said 1 to 5 until 2026-10-04 "
+     "and reported two genuine half-star reviews on production)."),
+
+    ("reviews hidden without a take-down on record",
+     "SELECT count(*) FROM reviews r WHERE r.is_removed = false "
+     "AND r.published_at IS NULL "
+     "AND r.created_at >= '2026-09-22' "
+     "AND NOT EXISTS (SELECT 1 FROM moderation_logs m WHERE m.target_ref = r.id "
+     "AND m.action = 'unpublish')",
+     "Reviews are public from submission (confirmed by Zient 2026-09-22); the "
+     "only way off the site is a moderator's take-down, which is audited. A "
+     "hidden review with no take-down means a code path hid it. (Every "
+     "unpublished, non-removed review is a queue card, so the old 'stranded' "
+     "check cannot fail any more. Reviews held under the old flow, submitted "
+     "before the change, are scripts/backfill_public_on_submit.py's scope.)"),
+
+    ("monetized but unverified",
+     "SELECT count(*) FROM reviews WHERE earn_eligible_status = 'monetized' "
+     "AND verification_status <> 'verified' "
+     "AND (review_id IS NULL OR review_id NOT LIKE 'rev_show_%')",
+     "referral_service holds that only a verified review can be monetized. "
+     "A row here is a state the code says is unreachable. "
+     "The `rev_show_` showcase fixtures are excluded DELIBERATELY and the "
+     "exclusion is narrow: those rows carry real affiliate links so the buy "
+     "path can be exercised, and they are unverified because a fixture must "
+     "never claim a proof of purchase it does not have. Marking them verified "
+     "to satisfy this check would put a false verified badge on the public "
+     "site, which is a worse lie than the one this exemption admits to. "
+     "Only scripts.seed_showcase can mint a `rev_show_` id — real ones are "
+     "`rev_<hex>` — so the exemption cannot be used to hide a genuine bypass."),
+
+    ("showcase fixture claiming a verified purchase",
+     "SELECT count(*) FROM reviews WHERE review_id LIKE 'rev_show_%' "
+     "AND verification_status = 'verified' AND review_id NOT IN ("
+     "'rev_show_jisulife', 'rev_show_macbook', 'rev_show_akko', "
+     "'rev_show_anker', 'rev_show_cerave', 'rev_show_airism')",
+     "The counterpart to the exemption above, and what keeps it honest. A "
+     "synthetic review may be monetized; it may not claim somebody proved a "
+     "purchase. The six named rows are the original showcase set, seeded "
+     "verified before this rule existed and kept that way because the E2E "
+     "suite pins them; every fixture added since must be unverified."),
+
+    ("monetized at two stars or below",
+     "SELECT count(*) FROM reviews WHERE earn_eligible_status = 'monetized' "
+     "AND star_rating <= 2",
+     "Low-star reviews route to the Honesty Fund and must never carry an "
+     "affiliate link - that separation is the platform's whole claim."),
+
+    ("commission splits that do not sum to the gross",
+     "SELECT count(*) FROM commissions WHERE gross_amount IS NOT NULL AND "
+     "coalesce(platform_share,0) + coalesce(reviewer_share,0) + "
+     "coalesce(honesty_fund_share,0) <> gross_amount",
+     "A centavo appeared or vanished in the 40/30/30 split."),
+
+    ("negative commission shares on a forward entry",
+     "SELECT count(*) FROM commissions WHERE reverses_commission_id IS NULL AND "
+     "(coalesce(platform_share,0) < 0 OR coalesce(reviewer_share,0) < 0 "
+     "OR coalesce(honesty_fund_share,0) < 0)",
+     "A share went negative. At 7000 bps the platform could land at -0.01 "
+     "before that was guarded; a row here predates the fix. Reversal rows are "
+     "excluded on purpose - their shares are negative by design (0031), which "
+     "is a paired, audited undo rather than a rounding fault."),
+
+    ("reversals that do not oppose their original",
+     "SELECT count(*) FROM commissions r JOIN commissions o "
+     "ON o.id = r.reverses_commission_id "
+     "WHERE r.reviewer_share <> -o.reviewer_share "
+     "OR r.platform_share <> -o.platform_share "
+     "OR r.honesty_fund_share <> -o.honesty_fund_share",
+     "A reversal must be the exact negation of the entry it undoes. Anything "
+     "else means the ledger and the wallet have quietly diverged."),
+
+    ("reversals pointing at another reversal",
+     "SELECT count(*) FROM commissions r JOIN commissions o "
+     "ON o.id = r.reverses_commission_id WHERE o.reverses_commission_id IS NOT NULL",
+     "A reversal of a reversal is not a correction, it is a double credit "
+     "wearing a disguise."),
+
+    ("honesty fund distributions with no reviewer",
+     "SELECT count(*) FROM honesty_fund_distributions WHERE reviewer_id IS NULL",
+     "A distribution records money paid to a specific reviewer. A NULL one is "
+     "either fixture residue whose user was deleted, or a real payment whose "
+     "recipient is now unknown - and the two look identical afterwards."),
+
+    ("honesty fund distributions dated at the epoch",
+     "SELECT count(*) FROM honesty_fund_distributions "
+     "WHERE cycle_month < DATE '2020-01-01'",
+     "cycle_month is the Manila month the pool was earned in. 1970-01-01 means "
+     "the row was written by a fixture rather than a distribution run."),
+
+    ("distributions whose cycle is not the first of a month",
+     "SELECT count(*) FROM honesty_fund_distributions "
+     "WHERE EXTRACT(DAY FROM cycle_month) <> 1",
+     "previous_cycle_month() always returns the first of a month, so anything "
+     "else was not written by the distributor."),
+
+    ("commissions whose cycle is not the first of a month",
+     "SELECT count(*) FROM commissions WHERE cycle_month IS NOT NULL "
+     "AND EXTRACT(DAY FROM cycle_month) <> 1",
+     "The Honesty Fund pools commissions by cycle_month equality, so a "
+     "mid-month value can never be matched by a cycle and its share is never "
+     "distributed."),
+
+    ("tables readable by anon over PostgREST",
+     "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+     "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+     "AND has_table_privilege('anon', c.oid, 'SELECT')",
+     "0029 revoked this. A table appearing here was almost certainly created "
+     "through the Supabase dashboard rather than by a migration: dashboard DDL "
+     "runs as supabase_admin, whose default privileges still grant new tables "
+     "to anon - and only supabase_admin can change that, which neither the "
+     "postgres role nor the SQL editor can do. Migrations run as postgres and "
+     "are unaffected. Revoke it, and prefer migrations for new tables."),
+
+    ("tables readable by the authenticated role",
+     "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+     "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+     "AND has_table_privilege('authenticated', c.oid, 'SELECT')",
+     "Same cause as above. The application authenticates as postgres and never "
+     "as this role, so anything reachable here is reachable around the API."),
+
+    ("tables without row level security",
+     "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+     "WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity",
+     "Every table has RLS on with nothing granted to the API roles (0002, 0087). "
+     "Twelve were created without it and only 0087 caught them up; a table here "
+     "is protected by its grants alone. ALTER TABLE ... ENABLE ROW LEVEL "
+     "SECURITY in a migration - the application's role owns it and is unaffected."),
+
+    ("reading sessions with dual or missing reader identity",
+     "SELECT count(*) FROM review_reading_sessions WHERE "
+     "(reader_kind = 'user') <> (reader_ref IS NOT NULL) OR "
+     "(reader_kind = 'anon') <> (anon_ref IS NOT NULL)",
+     "ck_reading_reader_user/ck_reading_reader_anon should make this "
+     "impossible; a row here carries two reader identities or none, which "
+     "defeats the separation the reading-telemetry design relies on."),
+
+    ("reading sessions past the retention cutoff",
+     "SELECT count(*) FROM review_reading_sessions "
+     "WHERE started_at < now() - interval '90 days'",
+     "retention_service.run_retention_sweep purges these at 90 days. A row "
+     "here means the sweep is not running or has fallen behind its "
+     "per-run batch ceiling."),
+
+    ("review view buckets past the retention cutoff",
+     "SELECT count(*) FROM review_view_buckets "
+     "WHERE bucket_start < now() - interval '90 days'",
+     "Same 90-day retention as the reading sessions above; migration 0033 "
+     "promised it and the sweep is what actually enforces it."),
+
+    ("request geo buckets past the retention cutoff",
+     "SELECT count(*) FROM request_geo_buckets "
+     "WHERE bucket_start < now() - interval '90 days'",
+     "Same 90-day retention, scheduled through the same sweep rather than the "
+     "incidental per-request path it used to run on."),
+
+    ("first-vote geo buckets past the retention cutoff",
+     "SELECT count(*) FROM review_first_vote_geo_buckets "
+     "WHERE bucket_start < now() - interval '90 days'",
+     "Same 90-day retention as the other telemetry aggregates."),
+)
+
+
+
+#: Seconds to wait for the database. Short: this tool reports, and a report
+#: that never arrives is worse than one that says it could not connect.
+CONNECT_TIMEOUT_SECONDS = 5
+
+
+def _probe_engine():
+    from sqlalchemy import create_engine
+
+    from app.core.config import settings
+    return create_engine(
+        settings.effective_database_url,
+        connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS},
+        pool_pre_ping=False,
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--strict", action="store_true",
+                    help="Exit non-zero if any invariant is violated.")
+    args = ap.parse_args()
+
+    from sqlalchemy.orm import Session
+
+    from app.core.env_guard import describe_target
+
+    print(f"[invariants] target: {describe_target()}")
+    print("[invariants] read-only; this writes nothing\n")
+
+    violations = 0
+    # Its own engine with a connect timeout rather than the application's.
+    # This is meant to be pointed at production from wherever the release is
+    # being run, and a refused connection fails in milliseconds while a port
+    # that drops packets never fails at all - the tool would sit there
+    # printing nothing. Same fault found in conftest and
+    # check_migration_safety, same fix.
+    engine = _probe_engine()
+
+    # Prove the connection once, before running anything. Each check catches
+    # its own errors so one bad query cannot hide the rest - but that also
+    # means an unreachable database is retried fifteen times, ten seconds
+    # apart, and the tool appears to hang. Fail here instead, with the reason.
+    try:
+        with engine.connect() as probe:
+            probe.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  cannot reach the database: {type(exc).__name__}")
+        print("  Nothing was checked. Confirm the target above is the one you "
+              "meant, and that it is reachable from here.")
+        return 2
+
+    unrunnable: list[str] = []
+    with Session(engine) as db:
+        for name, sql, meaning in CHECKS:
+            try:
+                count = db.execute(text(sql)).scalar() or 0
+            except Exception as exc:  # noqa: BLE001
+                # Roll back before the next check. Postgres aborts the whole
+                # transaction on any error, so without this one unrunnable
+                # query turns every check after it into InternalError - which
+                # is how a single missing column blinded eight of twenty here.
+                db.rollback()
+                unrunnable.append(name)
+                print(f"  ????  {name}: could not run ({type(exc).__name__})")
+                continue
+            if count:
+                violations += 1
+                print(f"  FAIL  {name}: {count}")
+                for line in _wrap(meaning, 66):
+                    print(f"        {line}")
+            else:
+                print(f"  ok    {name}")
+
+        bucket_violations, bucket_note = _check_buckets(db)
+        violations += bucket_violations
+        if bucket_note:
+            print(f"  n/a   {bucket_note}")
+
+    print()
+    if violations:
+        print(f"{violations} invariant(s) violated.")
+        if unrunnable:
+            print(f"{len(unrunnable)} could not run at all.")
+        return 1 if args.strict else 0
+
+    # A check that could not run is not a check that passed. Reporting "all
+    # invariants hold" while some never executed is the failure mode this tool
+    # exists to prevent, so it is spelled out rather than rounded up.
+    if unrunnable:
+        print(f"{len(CHECKS) - len(unrunnable)} of {len(CHECKS)} invariants hold; "
+              f"{len(unrunnable)} COULD NOT RUN:")
+        for name in unrunnable:
+            print(f"  - {name}")
+        print()
+        print("An unrunnable check is usually a schema the database has not "
+              "reached yet. Verify the target's migration revision.")
+        return 1 if args.strict else 0
+
+    print(f"All {len(CHECKS)} invariants hold.")
+    return 0
+
+
+def _check_buckets(db) -> tuple[int, str | None]:
+    """Every bucket the code writes to exists, with the privacy it needs.
+
+    Kept out of CHECKS: storage.buckets exists only on a Supabase database, so
+    on a plain Postgres this is "not applicable", never "could not run". A
+    missing bucket is how every Inbox / claim-evidence file failed for weeks
+    (2026-10-04, fixed by 0086); nothing in the database looked wrong.
+    Returns (violations, a note when not applicable)."""
+    from app.services.storage import BUCKETS
+
+    if db.execute(text("SELECT to_regclass('storage.buckets')")).scalar() is None:
+        return 0, "storage buckets: no storage schema here (not a Supabase database)"
+    have = dict(db.execute(text("SELECT id, public FROM storage.buckets")).all())
+    violations = 0
+    for name, public in BUCKETS.items():
+        if name not in have:
+            problem = "missing (migration 0086 creates it)"
+        elif have[name] is not public:
+            problem = f"is {'public' if have[name] else 'private'}, must be " \
+                      f"{'public' if public else 'private'}"
+        else:
+            print(f"  ok    storage bucket {name}")
+            continue
+        violations += 1
+        print(f"  FAIL  storage bucket {name}: {problem}")
+    return violations, None
+
+
+def _wrap(text_: str, width: int) -> list[str]:
+    words, lines, cur = text_.split(), [], ""
+    for word in words:
+        if len(cur) + len(word) + 1 > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

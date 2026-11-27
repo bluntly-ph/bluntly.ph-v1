@@ -1,0 +1,157 @@
+name: Scheduled maintenance
+
+# MANUAL BACKUP ONLY. Vercel Cron is the production scheduler.
+#
+# Production maintenance runs from the `crons` entry in /vercel.json: every
+# five minutes Vercel calls GET /api/v1/internal/cron/tick, which runs every
+# scheduled task, in order, through the same code path this workflow calls
+# (backend/app/api/v1/routes/internal_cron.py, SCHEDULE). The reason this
+# workflow used to be the scheduler, the Hobby plan's two daily cron entries,
+# no longer applies: the team is on Pro. Its hourly schedule also used most of
+# the Actions minutes and stopped running entirely during the October 2026
+# billing hold.
+#
+# What is left is a manual backup: Actions -> Scheduled maintenance -> Run
+# workflow runs ONE task now. The endpoint still decides whether that task is
+# due: before its threshold it answers skipped_not_due, after the period is
+# done it answers skipped_already_completed, so a run that races the Vercel
+# tick is harmless. Resumable sweeps are called again until they finish.
+
+on:
+  # No `schedule:` trigger: Vercel Cron schedules production (see above).
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Run one task now (must be in the endpoint's allow-list)"
+        required: true
+        type: choice
+        options:
+          - pii_retention
+          - recompute_wilson_scores
+          - recompute_all_trust
+          - integrity_sweep
+          - expire_requests
+          - refresh_payout_batches
+          - honesty_fund_distribution
+          - schedule_payouts
+          - priority_tiers
+          - send_emails
+          - weekly_summaries
+          - reconcile_admin_upvotes
+
+concurrency:
+  # One maintenance run at a time. The endpoint's period claim is the real
+  # guard — this only avoids piling workflows up.
+  group: scheduled-maintenance
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run one maintenance task
+    runs-on: ubuntu-latest
+    # A daily population sweep (Wilson, trust) can take many calls.
+    timeout-minutes: 60
+    steps:
+      - name: Run the chosen task
+        env:
+          # The secret travels in a header, never a query string, so it cannot
+          # reach an access log or a redirect target. It is never echoed.
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          BASE: ${{ vars.PRODUCTION_BASE_URL || 'https://www.bluntly.ph' }}
+          MANUAL: ${{ inputs.task }}
+        run: |
+          set -uo pipefail
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET is not configured for this repository."
+            exit 1
+          fi
+
+          tasks="$MANUAL"
+
+          # Two of the jobs recompute a whole population one record at a time
+          # and cannot finish inside a single serverless request, so the API
+          # answers `continuing` and we call again. The backend owns the cursor
+          # entirely — nothing about position is sent from here, so this loop
+          # cannot be used to steer or truncate a traversal.
+          #
+          # MAX_CALLS is a safety net, not the mechanism. Running out of calls
+          # is NOT success: the period stays `continuing` with its cursor
+          # intact, the run fails visibly, and the next run picks the traversal
+          # up where it stopped. Nothing is marked complete.
+          invoke() {
+            local TASK=$1 MAX_CALLS=200 MAX_BUSY_RETRIES=5 BACKOFF=30
+            local call=0 busy=0 total=0 code status batch
+            while [ "$call" -lt "$MAX_CALLS" ]; do
+              call=$((call + 1))
+              code=$(curl -sS -o response.json -w "%{http_code}" \
+                       -X POST "$BASE/api/v1/internal/cron/$TASK" \
+                       -H "X-Cron-Key: $CRON_SECRET" \
+                       -H "Content-Type: application/json" \
+                       --max-time 300 --retry 2 --retry-delay 30 --retry-connrefused)
+
+              # The body carries a task name, a status and counts. No payloads,
+              # no identifiers, nothing sensitive — safe to print, and the only
+              # record a reader of this log gets.
+              echo "$TASK call $call -> HTTP $code"
+              cat response.json || true
+              echo
+
+              case "$code" in
+                200) ;;
+                401|503) echo "::error::Scheduler credential rejected or unconfigured."; return 2 ;;
+                404) echo "::error::Task '$TASK' is not in the endpoint allow-list."; return 1 ;;
+                *)   echo "::error::Maintenance task '$TASK' failed with HTTP $code"; return 1 ;;
+              esac
+
+              status=$(python3 -c "import json;print(json.load(open('response.json')).get('status',''))")
+              batch=$(python3 -c "import json;print(json.load(open('response.json')).get('processed') or 0)")
+              total=$((total + batch))
+
+              case "$status" in
+                ok)
+                  echo "::notice::$TASK completed after $call call(s), $total record(s)"
+                  return 0 ;;
+                skipped_not_due|skipped_already_completed)
+                  return 0 ;;
+                continuing)
+                  busy=0
+                  continue ;;
+                skipped_already_running)
+                  busy=$((busy + 1))
+                  if [ "$busy" -gt "$MAX_BUSY_RETRIES" ]; then
+                    echo "::error::$TASK still held after $busy attempts; giving up."
+                    return 1
+                  fi
+                  echo "another runner holds the lease; retrying in ${BACKOFF}s ($busy/$MAX_BUSY_RETRIES)"
+                  sleep "$BACKOFF"
+                  # Capped: 30+60+120+120+120 is 7.5 minutes of waiting at most.
+                  BACKOFF=$((BACKOFF * 2))
+                  if [ "$BACKOFF" -gt 120 ]; then BACKOFF=120; fi
+                  continue ;;
+                failed)
+                  echo "::error::$TASK reported failure"
+                  return 1 ;;
+                *)
+                  echo "::error::$TASK returned an unrecognised status '$status'"
+                  return 1 ;;
+              esac
+            done
+            # Out of calls. The period is still incomplete and must be visible
+            # as such — the backend has NOT marked it done, its cursor is intact.
+            echo "::error::$TASK did not finish within $MAX_CALLS calls; period left incomplete and resumable"
+            return 1
+          }
+
+          # One task failing does not stop the rest; the run fails at the end.
+          # A rejected credential stops everything: every call would fail the same way.
+          failed=""
+          for task in $tasks; do
+            invoke "$task"
+            rc=$?
+            if [ "$rc" -eq 2 ]; then exit 1; fi
+            if [ "$rc" -ne 0 ]; then failed="$failed $task"; fi
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::Failed:$failed"
+            exit 1
+          fi

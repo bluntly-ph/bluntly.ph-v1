@@ -1,0 +1,914 @@
+"""Referral link flow (M2 slice 1) — publication gate, attach/publish/reject/revoke,
+attribution redirect, RBAC (integration).
+
+Also the canonical priority-queue contract (Task 2): the prioritized `items`
+slice, its `counts`, server filters, and stable policy ordering.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from app.services.moderation_priority import PriorityBand, PriorityLane, SlaState
+from tests.conftest import (
+    make_established,
+    owned_photo_url,
+    register_and_token,
+    register_commenter,
+    requires_db,
+)
+
+SHOPEE_URL = "https://shopee.ph/product/abc-i.123.456"
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _make_review(client, headers, *, stars: int = 4, photo: bool = True,
+                 name: str = "Widget", verdict: str = "yes_absolutely") -> tuple[str, str]:
+    """A pending review. The product name carries a unique token, and the
+    review's body repeats it, so a test can scope a queue read to its own
+    fixtures with `?q=` — see `_unique_name`.
+
+    That matters because the CI database is shared and long-lived: a queue read
+    with a bare `limit=100` is a page of a backlog that grows with every run,
+    and "my review is in the first hundred" stops being true without anything
+    having broken."""
+    unique = f"{name} {uuid.uuid4().hex[:8]}"
+    pid = client.post("/api/v1/products", headers=headers,
+                      json={"name": unique, "category": "electronics"}).json()["id"]
+    body = {"product_id": pid, "title": "Great",
+            "discussion": f"Used it for weeks; solid. Fixture {unique}.",
+            "verdict": verdict, "star_rating": stars}
+    if photo:
+        body["photo_url"] = owned_photo_url(headers)
+    created = client.post("/api/v1/reviews", headers=headers, json=body)
+    assert created.status_code == 201, created.text
+    _LAST_FIXTURE_NAME[created.json()["id"]] = unique
+    return created.json()["id"], pid
+
+
+#: review id -> the unique product name in its fixture, for scoping queue reads.
+_LAST_FIXTURE_NAME: dict[str, str] = {}
+
+
+@requires_db
+def test_full_referral_flow(client):
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+
+    rid, _ = _make_review(client, ah, stars=4)
+
+    # Public from submission (confirmed by Zient 2026-09-22): readable by
+    # anyone, before any moderator has looked at it.
+    assert client.get(f"/api/v1/reviews/{rid}").status_code == 200
+    assert client.get(f"/api/v1/reviews/{rid}").json()["earn_eligible_status"] == "pending"
+
+    # And in the moderator's earn_eligible queue (Seeding Phase).
+    from tests.conftest import find_pending_queue_item
+    assert find_pending_queue_item(client, mh, rid) is not None
+    # Non-moderator is forbidden.
+    assert client.get("/api/v1/admin/review-queue", headers=ah).status_code == 403
+
+    # Paste link → monetized + published (one action).
+    attach = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                         json={"url": SHOPEE_URL, "platform": "shopee"})
+    assert attach.status_code == 200, attach.text
+    body = attach.json()
+    assert body["earn_eligible_status"] == "monetized"
+    assert body["published_at"] is not None
+    assert body["referral_redirect_url"] == f"/r/{rid}"
+    # Raw affiliate URL must NOT be exposed.
+    assert "affiliate_link" not in body and SHOPEE_URL not in str(body)
+
+    # Now public.
+    assert rid in [r["id"] for r in client.get("/api/v1/reviews").json()]
+
+    # Attribution redirect → 302 to the affiliate URL + a click session row.
+    from app.db.session import SessionLocal
+    from app.models.session import Session as ClickSession
+    resp = client.get(f"/r/{rid}", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == SHOPEE_URL
+    db = SessionLocal()
+    try:
+        import uuid as _uuid
+
+        from sqlalchemy import func, select
+        n = db.scalar(select(func.count(ClickSession.id)).where(
+            ClickSession.review_id == _uuid.UUID(rid)))
+        assert n == 1
+    finally:
+        db.close()
+
+    # Revoke → stays published, drops to approved, redirect 404s.
+    rev = client.request("DELETE", f"/api/v1/admin/reviews/{rid}/referral-link",
+                         headers=mh, json={"reason": "expired link"})
+    assert rev.status_code == 200
+    assert rev.json()["earn_eligible_status"] == "approved"
+    assert rev.json()["published_at"] is not None       # still live
+    assert client.get(f"/r/{rid}", follow_redirects=False).status_code == 404
+
+    # Re-attach works.
+    again = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                        json={"url": SHOPEE_URL, "platform": "shopee"})
+    assert again.status_code == 200
+    assert again.json()["earn_eligible_status"] == "monetized"
+
+    # History shows revoked + active.
+    hist = client.get(f"/api/v1/admin/reviews/{rid}/referral-links", headers=mh).json()
+    statuses = sorted(link["status"] for link in hist)
+    assert statuses == ["active", "revoked"]
+
+
+@requires_db
+def test_a_hard_pass_routes_to_the_fund_whatever_its_stars(client):
+    """Business Rules §14: the verdict decides the track. "Hard pass" at four
+    stars is Honesty Fund, not commission; the stars never override it."""
+    _, author_token, _ = register_and_token(client)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    rid, _ = _make_review(client, _auth(author_token), stars=4, verdict="hard_pass")
+
+    # A fund-track review never carries an affiliate link.
+    bad = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                      json={"url": SHOPEE_URL, "platform": "shopee"})
+    assert bad.status_code == 409 and bad.json()["code"] == "fund_track_no_link"
+
+    # Publish without a link → Honesty Fund, live.
+    pub = client.post(f"/api/v1/admin/reviews/{rid}/publish", headers=mh)
+    assert pub.status_code == 200
+    assert pub.json()["earn_eligible_status"] == "honesty_fund"
+    assert pub.json()["published_at"] is not None
+
+
+@requires_db
+def test_a_rejected_review_stays_public_and_cannot_be_edited_back_into_the_queue(client):
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    rid, _ = _make_review(client, ah, stars=5)
+
+    rej = client.post(f"/api/v1/admin/reviews/{rid}/reject", headers=_auth(mod_token),
+                      json={"reason": "needs a clearer proof photo"})
+    assert rej.status_code == 200
+    assert rej.json()["earn_eligible_status"] == "rejected"
+    # Rejecting earnings never hides the review.
+    assert rej.json()["published_at"] is not None
+
+    # Business Rules §4: published content is frozen, so an edit can no longer
+    # be a way back into the earnings queue.
+    edited = client.patch(f"/api/v1/reviews/{rid}", headers=ah,
+                          json={"discussion": "Reworded with more detail.", "change_note": "fix"})
+    assert edited.status_code == 409
+    assert edited.json()["code"] == "review_content_frozen"
+
+
+@requires_db
+def test_unverified_cannot_be_monetized(client):
+    _, author_token, _ = register_and_token(client)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    rid, _ = _make_review(client, _auth(author_token), stars=4, photo=False)  # unverified
+    r = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=_auth(mod_token),
+                    json={"url": SHOPEE_URL, "platform": "shopee"})
+    assert r.status_code == 409 and r.json()["code"] == "review_not_verified"
+
+
+@requires_db
+def test_url_validation_via_attach(client):
+    _, author_token, _ = register_and_token(client)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    rid, _ = _make_review(client, _auth(author_token), stars=4)
+
+    # Wrong platform for a valid shopee URL.
+    r1 = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                     json={"url": SHOPEE_URL, "platform": "amazon"})
+    assert r1.status_code == 422 and r1.json()["code"] == "affiliate_url_invalid"
+    # http (not https).
+    r2 = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                     json={"url": "http://shopee.ph/x", "platform": "shopee"})
+    assert r2.status_code == 422
+    # Unrelated domain.
+    r3 = client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                     json={"url": "https://evil.example.com/x", "platform": "shopee"})
+    assert r3.status_code == 422
+
+
+@requires_db
+def test_admin_routes_require_moderator(client):
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    rid, _ = _make_review(client, ah, stars=4)
+    link_body = {"url": SHOPEE_URL, "platform": "shopee"}
+    for method, path, body in [
+        ("post", f"/api/v1/admin/reviews/{rid}/referral-link", link_body),
+        ("post", f"/api/v1/admin/reviews/{rid}/publish", None),
+        ("post", f"/api/v1/admin/reviews/{rid}/reject", {"reason": "x"}),
+        ("post", f"/api/v1/admin/reviews/{rid}/unpublish", {"reason": "Test take-down."}),
+    ]:
+        resp = client.request(method, path, headers=ah, json=body)
+        assert resp.status_code == 403, f"{path} -> {resp.status_code}"
+
+
+@requires_db
+def test_edited_since_monetized_is_retired_because_content_is_frozen(client):
+    """The old re-check existed for a monetized review edited in place. §4 makes
+    that impossible, so the queue no longer carries the case at all; a photo
+    swap is audited on its own and changes nothing about earning."""
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    rid, _ = _make_review(client, ah, stars=4)
+    assert client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                       json={"url": SHOPEE_URL, "platform": "shopee"}).status_code == 200
+    refused = client.patch(f"/api/v1/reviews/{rid}", headers=ah,
+                           json={"title": "Great (revised)", "change_note": "typo"})
+    assert refused.status_code == 409
+    queue = client.get(
+        "/api/v1/admin/review-queue?limit=100&factor=edited_after_monetization"
+        f"&q={_LAST_FIXTURE_NAME[rid]}",
+        headers=mh,
+    ).json()
+    assert rid not in [item["review"]["id"] for item in queue["items"]]
+
+
+@requires_db
+def test_unpublish_returns_the_review_to_the_queue(client):
+    """Unpublishing must not strand the review where no moderator can find it.
+
+    Production once had two taken-down reviews gone from the site *and* from
+    the queue, one for eleven days. Since 2026-09-22 a take-down leaves the
+    earning state alone and the review is served as an unpublished card in the
+    queue, where the moderator can restore it (or still decide its earnings).
+    """
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    rid, _ = _make_review(client, ah, stars=4)
+
+    assert client.post(f"/api/v1/admin/reviews/{rid}/publish",
+                       headers=mh).status_code == 200
+    unpub = client.post(f"/api/v1/admin/reviews/{rid}/unpublish", headers=mh,
+                        json={"reason": "Test take-down."})
+    assert unpub.status_code == 200, unpub.text
+
+    body = unpub.json()
+    assert body["published_at"] is None
+    assert body["earn_eligible_status"] == "approved"   # untouched by the take-down
+
+    from tests.conftest import find_pending_queue_item
+    # MQA-015: a take-down is a decision, so the review leaves the working list
+    # ("waiting") - and is still one switch away, in the "taken_down" view.
+    assert find_pending_queue_item(client, mh, rid, view="taken_down") is not None, \
+        "unpublished review is not in the moderation queue's Taken down view"
+    assert find_pending_queue_item(client, mh, rid) is None, \
+        "a taken-down review still sits among the reviews waiting for a decision"
+
+    # Restoring puts it back as it was; earnings can still be rejected after.
+    restored = client.post(f"/api/v1/admin/reviews/{rid}/restore", headers=mh)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["published_at"] is not None
+    assert client.post(f"/api/v1/admin/reviews/{rid}/reject", headers=mh,
+                       json={"reason": "acceptance"}).status_code == 200
+
+
+@requires_db
+def test_unpublish_does_not_leave_a_paying_link(client):
+    """A monetized review taken down must stop attributing clicks."""
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    rid, _ = _make_review(client, ah, stars=4)
+
+    client.post(f"/api/v1/admin/reviews/{rid}/referral-link", headers=mh,
+                json={"url": SHOPEE_URL, "platform": "shopee"})
+    assert client.get(f"/r/{rid}", follow_redirects=False).status_code == 302
+
+    assert client.post(f"/api/v1/admin/reviews/{rid}/unpublish", headers=mh,
+                       json={"reason": "Test take-down."}).status_code == 200
+    assert client.get(f"/r/{rid}", follow_redirects=False).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Canonical priority queue contract (Task 2)
+# --------------------------------------------------------------------------- #
+
+_NOW = datetime(2026, 9, 8, 12, 0, 0, tzinfo=UTC)
+
+
+def _assessed_card(review_id, order_key, *, band, lane, sla, kind="pending",
+                   title="card", discussion="body", product_name=None, factors=(),
+                   report_count=0):
+    """A hand-built ``referral_service._AssessedCard`` for the pure ordering/
+    filter/count helpers — no database, no evaluator."""
+    from app.models.review import Review
+    from app.schemas.referral import (
+        QueueItem,
+        QueuePriorityAssessment,
+        QueuePriorityFactor,
+        QueueProduct,
+    )
+    from app.schemas.review import ReviewOut
+    from app.services import referral_service
+
+    priority = QueuePriorityAssessment(
+        policy_version="review-priority-v2", lane=lane, score=0, band=band,
+        sla_state=sla, due_at=_NOW,
+        factors=[QueuePriorityFactor(code=c, observed=True, contribution=5,
+                                     explanation=c) for c in factors],
+    )
+    review = ReviewOut(
+        id=review_id, product_id=review_id, title=title, discussion=discussion,
+        verdict="it_depends", star_rating=3, verification_status="unverified",
+        current_version=1, earn_eligible_status="pending",
+        created_at=_NOW, updated_at=_NOW,
+    )
+    item = QueueItem(
+        review=review,
+        product=QueueProduct(id=review_id, canonical_name=product_name),
+        priority=priority,
+    )
+    # `review` is the unsaved ORM row the whole-queue aggregation reads columns
+    # from; the pure ordering/filter/count helpers below never touch it, so an
+    # instance carrying only the id is enough and needs no session.
+    return referral_service._AssessedCard(
+        review_id=review_id, kind=kind, item=item, order_key=order_key,
+        review=Review(id=review_id), report_count=report_count,
+    )
+
+
+def test_assessment_to_queue_schema_maps_every_field():
+    from app.models.enums import ModerationReason
+    from app.services.moderation_priority import PriorityFacts, evaluate_priority
+    from app.services.referral_service import assessment_to_queue_schema
+
+    facts = PriorityFacts(
+        queued_at=_NOW - timedelta(hours=6), report_count=4,
+        report_reasons=frozenset({ModerationReason.fake_proof}),
+        edited_since_monetized=True, velocity=True, collusion=False,
+        duplicate_content=False, manually_escalated=False,
+    )
+    assessment = evaluate_priority(facts, now=_NOW)
+    schema = assessment_to_queue_schema(assessment)
+
+    assert schema.policy_version == "review-priority-v2"
+    assert schema.lane == assessment.lane
+    assert schema.score == assessment.integrity_score
+    assert schema.band == assessment.band
+    assert schema.sla_state == assessment.sla_state
+    assert schema.due_at == assessment.due_at
+    assert [f.code for f in schema.factors] == [f.code for f in assessment.factors]
+    assert [f.contribution for f in schema.factors] == [
+        f.contribution for f in assessment.factors]
+    # order_key is server-internal and must not leak onto the wire.
+    assert "order_key" not in schema.model_dump()
+
+
+def test_paginate_cards_orders_by_policy_then_review_id_filters_and_counts():
+    import uuid
+
+    from app.services import referral_service as rs
+
+    a, b, c = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
+    cards = [
+        _assessed_card(b, (2, 2, 0), band=PriorityBand.low,
+                       lane=PriorityLane.routine, sla=SlaState.on_track),
+        # a and c share an order_key -> deterministic tie-break on review id.
+        _assessed_card(c, (1, 0, 0), band=PriorityBand.high,
+                       lane=PriorityLane.reported, sla=SlaState.overdue,
+                       factors=("report_count_4_plus",)),
+        _assessed_card(a, (1, 0, 0), band=PriorityBand.high,
+                       lane=PriorityLane.reported, sla=SlaState.overdue,
+                       factors=("report_count_4_plus",)),
+    ]
+
+    page = rs._paginate_cards(cards, rs.QueueQuery(limit=2))
+    assert [item.review.id for item in page.items] == [a, c]
+    assert page.total == 3
+    assert page.next_cursor is None
+    assert page.counts.total == 3
+    assert page.counts.by_band["high"] == 2
+    assert page.counts.by_band["low"] == 1
+    assert page.counts.by_lane["reported"] == 2
+    assert page.counts.by_sla["overdue"] == 2
+
+    # Stable across repeated calls.
+    assert [i.review.id for i in rs._paginate_cards(cards, rs.QueueQuery()).items] == \
+           [i.review.id for i in rs._paginate_cards(cards, rs.QueueQuery()).items]
+
+    # Server filters narrow both the page and the counts.
+    band_only = rs._paginate_cards(cards, rs.QueueQuery(band=PriorityBand.low))
+    assert [i.review.id for i in band_only.items] == [b]
+    assert band_only.total == 1 and band_only.counts.by_band["low"] == 1
+
+    factor_only = rs._paginate_cards(
+        cards, rs.QueueQuery(factor="report_count_4_plus"))
+    assert {i.review.id for i in factor_only.items} == {a, c}
+
+    lane_miss = rs._paginate_cards(cards, rs.QueueQuery(lane=PriorityLane.escalated))
+    assert lane_miss.items == [] and lane_miss.total == 0
+
+    sla_only = rs._paginate_cards(cards, rs.QueueQuery(sla=SlaState.on_track))
+    assert [i.review.id for i in sla_only.items] == [b]
+    assert sla_only.total == 1 and sla_only.counts.by_sla["on_track"] == 1
+
+    second_item = rs._paginate_cards(cards, rs.QueueQuery(limit=1, offset=1))
+    assert [i.review.id for i in second_item.items] == [c]
+    # Counts and total describe the filtered queue, not the offset window.
+    assert second_item.total == 3 and second_item.counts.total == 3
+
+
+def test_review_queue_serves_one_page_from_one_assessment(monkeypatch):
+    """The route evaluates the backlog once and returns exactly that page.
+
+    This test replaces one that asserted the deprecated `pending` /
+    `edited_since_monetized` arrays were built from the same assessment as
+    `items`. Those arrays are gone: they duplicated the page under a split the
+    policy does not use, and two orderings of one backlog is how the console
+    came to rank the queue differently from the server. What survives is the
+    property that mattered — the unprioritized `get_queue` path is never used
+    to answer this endpoint.
+    """
+    import uuid
+
+    from app.api.v1.routes import admin_referral
+    from app.services import referral_service as rs
+
+    review_id = uuid.UUID(int=41)
+    card = _assessed_card(
+        review_id,
+        (3, 2, 0),
+        band=PriorityBand.low,
+        lane=PriorityLane.routine,
+        sla=SlaState.on_track,
+    )
+    page = rs._paginate_cards([card], rs.QueueQuery())
+
+    calls: list[rs.QueueQuery] = []
+
+    def one_assessment(db, query, *, now=None):
+        calls.append(query)
+        return page
+
+    monkeypatch.setattr(rs, "get_prioritized_queue", one_assessment)
+
+    def unprioritized_is_a_bug(*args, **kwargs):
+        raise AssertionError("the queue endpoint must not fall back to get_queue")
+
+    monkeypatch.setattr(rs, "get_queue", unprioritized_is_a_bug)
+
+    response = admin_referral.review_queue(
+        db=object(),
+        band=None,
+        lane=None,
+        sla=None,
+        factor=None,
+        q=None,
+        tier=None,
+        sort="policy",
+        limit=50,
+        offset=0,
+    )
+
+    assert len(calls) == 1, "one evaluation per request"
+    assert response.items == page.items
+    assert response.total == page.total
+    assert response.counts == page.counts
+    # The split views are gone from the contract, not merely emptied.
+    assert not hasattr(response, "pending")
+    assert not hasattr(response, "edited_since_monetized")
+
+
+def _make_pending(client, headers, token, *, verdict="it_depends", stars=3):
+    """A pending (unpublished) review whose title carries a unique ``token`` so
+    the queue's ``q`` filter can scope a test to exactly its own fixtures.
+
+    Each call is a distinct SUBMISSION — the title carries a per-call nonce —
+    but every call shares one BODY, and both halves of that are load-bearing.
+
+    The title differs because callers ask for three or four in a row, product
+    deduplication folds the identical names into one product, and a repeated
+    title AND body from one author to one product is exactly the double submit
+    BUG-031's guard refuses.
+
+    The body stays identical so the duplicate-content signal can match an
+    author's later submission against an earlier one (it compares `discussion`
+    only, and since 2026-09-29 flags only the later copy).
+    `test_review_queue_ties_are_stable_across_repeated_calls` gets its identical,
+    non-empty factor set from the verdict/star mismatch instead: its four reviews
+    share one timestamp, so none of them is "earlier".
+    """
+    nonce = uuid.uuid4().hex[:6]
+    # One product per call: an author reviews a product once (Business Rules
+    # §4). The duplicate-content signal still fires, because it compares an
+    # author's reviews across products as well.
+    pid = client.post("/api/v1/products", headers=headers,
+                      json={"name": f"PrioWidget {token} {nonce}",
+                            "category": "electronics"}).json()["id"]
+    body = {"product_id": pid, "title": f"Queued {token} {nonce}",
+            "discussion": f"Priority-contract fixture {token}; weeks of use.",
+            "verdict": verdict, "star_rating": stars,
+            "photo_url": owned_photo_url(headers)}
+    created = client.post("/api/v1/reviews", headers=headers, json=body)
+    assert created.status_code == 201, created.text
+    return created.json()["id"]
+
+
+def _backdate(review_ids, *, hours):
+    import uuid as _uuid
+
+    from app.db.session import SessionLocal
+    from app.models.review import Review
+
+    db = SessionLocal()
+    try:
+        stamp = datetime.now(UTC) - timedelta(hours=hours)
+        for rid in review_ids:
+            db.get(Review, _uuid.UUID(rid)).created_at = stamp
+        db.commit()
+    finally:
+        db.close()
+
+
+def _insert_pending_reviews(*, count, token):
+    """Insert a large, isolated queue cohort in one transaction.
+
+    Every fixture is anonymous and has its own product, so duplicate-content
+    matching cannot turn the ordinary cohort into integrity-lane work.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    from app.db.session import SessionLocal
+    from app.models.enums import EarnEligibleStatus, Verdict
+    from app.models.product import Product
+    from app.models.review import Review
+
+    db = SessionLocal()
+    try:
+        review_ids = []
+        for index in range(count):
+            product = Product(
+                product_id=f"prd_{uuid.uuid4().hex[:10]}",
+                canonical_name=f"Boundary product {token} {index}",
+                category="electronics",
+            )
+            db.add(product)
+            db.flush()
+            review = Review(
+                review_id=f"rev_{uuid.uuid4().hex[:10]}",
+                product_id=product.id,
+                author_id=None,
+                title=f"Boundary queue {token} {index}",
+                discussion=f"Independent boundary fixture {index} for {token}.",
+                verdict=Verdict.it_depends,
+                star_rating=3,
+                # Public from submission; `pending` = awaiting the earnings call.
+                published_at=datetime.now(UTC),
+                earn_eligible_status=EarnEligibleStatus.pending,
+            )
+            db.add(review)
+            db.flush()
+            review_ids.append(str(review.id))
+        db.commit()
+        return review_ids
+    finally:
+        db.close()
+
+
+@requires_db
+def test_review_queue_priority_pagination_and_band_filter(client):
+    """The pinned Task 2 example, scoped with ``q`` so it is stable on the
+    persistent test database."""
+    import uuid
+
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    moderator_headers = _auth(mod_token)
+
+    token = uuid.uuid4().hex[:12]
+    rids = [_make_pending(client, ah, token) for _ in range(3)]
+    # Two days in the queue on a 24h routine SLA -> overdue -> band "high".
+    _backdate(rids, hours=48)
+
+    response = client.get(
+        f"/api/v1/admin/review-queue?limit=2&band=high&q={token}",
+        headers=moderator_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+    assert all(item["priority"]["band"] == "high" for item in body["items"])
+    assert body["items"][0]["priority"]["policy_version"] == "review-priority-v2"
+    assert body["counts"]["by_band"]["high"] == 3
+    assert body["counts"]["total"] == 3
+    # Each card still says which timestamp stood in for the queue-entry time.
+    assert all(item["queue_time_basis"] == "review_created_at"
+               for item in body["items"])
+
+
+@requires_db
+def test_review_queue_high_priority_new_review_leads_page_one(client):
+    """A high-priority review created AFTER a batch of ordinary ones still leads
+    page one — the old created-at ordering would have buried it last."""
+    import uuid
+
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+
+    token = uuid.uuid4().hex[:12]
+    ordinary = _insert_pending_reviews(count=51, token=token)
+
+    # Created last, so it is newest by created_at, and reported four times for
+    # fake proof while it waits for its earnings decision -> escalated. (It used
+    # to be taken down first; a taken-down review is in its own view now,
+    # MQA-015, so this one stays among the reviews waiting for a decision.)
+    hot = _make_pending(client, ah, token, stars=4)
+    # Established reporters (Stage 2, full reputation): each weighs 1.0, so
+    # together they cross the one escalation threshold (Business Rules §12).
+    for _ in range(4):
+        reporter_id, reporter_token, _ = register_and_token(client)
+        make_established(reporter_id)
+        assert client.post(f"/api/v1/reviews/{hot}/report", headers=_auth(reporter_token),
+                           json={"reason": "fake_proof"}).status_code == 201
+
+    from app.db.session import SessionLocal
+    from app.services.referral_service import get_queue
+
+    db = SessionLocal()
+    try:
+        old_first_50, _ = get_queue(db, limit=50)
+        assert hot not in {str(review.id) for review in old_first_50}
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/v1/admin/review-queue?q={token}&limit=10", headers=mh
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = [item["review"]["id"] for item in body["items"]]
+    assert body["total"] == 52
+    assert len(ids) == 10
+    assert ids[0] == hot
+    assert set(ids[1:]).issubset(set(ordinary))
+    assert body["items"][0]["priority"]["band"] == "high"
+    assert body["items"][0]["priority"]["lane"] == "escalated"
+    assert any(f["code"] == "report_weight_threshold"
+               for f in body["items"][0]["priority"]["factors"])
+    assert "user_reported" in body["items"][0]["priority"]["origins"]
+
+    # Recency alone would have placed it dead last.
+    from app.models.review import Review
+
+    db = SessionLocal()
+    try:
+        hot_created_at = db.get(Review, uuid.UUID(hot)).created_at
+        ordinary_created_ats = [
+            db.get(Review, uuid.UUID(review_id)).created_at for review_id in ordinary
+        ]
+    finally:
+        db.close()
+    assert all(created_at < hot_created_at for created_at in ordinary_created_ats)
+
+
+@requires_db
+def test_review_queue_ties_are_stable_across_repeated_calls(client):
+    import uuid as _uuid
+
+    from app.db.session import SessionLocal
+    from app.models.review import Review
+
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+
+    token = _uuid.uuid4().hex[:12]
+    # "Hard pass" at 3 stars: the verdict/star mismatch fires identically on all
+    # four, so every card carries the same non-empty factor set. (This used to
+    # lean on the duplicate-content signal, but that now flags only a LATER
+    # copy - dev/QA sync 2026-09-29 - and these four share one timestamp.)
+    rids = [_make_pending(client, ah, token, verdict="hard_pass", stars=3) for _ in range(4)]
+
+    # Identical queued_at -> identical order_key -> the only differentiator is the
+    # review UUID appended to the sort key.
+    db = SessionLocal()
+    try:
+        stamp = datetime.now(UTC) - timedelta(hours=1)
+        for rid in rids:
+            db.get(Review, _uuid.UUID(rid)).created_at = stamp
+        db.commit()
+    finally:
+        db.close()
+
+    first = client.get(f"/api/v1/admin/review-queue?q={token}&limit=10",
+                       headers=mh).json()["items"]
+    second = client.get(f"/api/v1/admin/review-queue?q={token}&limit=10",
+                        headers=mh).json()["items"]
+    order_one = [i["review"]["id"] for i in first]
+    order_two = [i["review"]["id"] for i in second]
+    assert order_one == order_two
+    assert order_one == sorted(order_one, key=_uuid.UUID)
+    factor_sets = [
+        tuple(factor["code"] for factor in item["priority"]["factors"])
+        for item in first
+    ]
+    assert all(factor_sets), "the tie regression must exercise non-empty assessments"
+    assert len(set(factor_sets)) == 1
+
+
+@requires_db
+def test_review_queue_mixes_pending_and_taken_down_sources_with_truthful_time_basis(client):
+    """The "edited since monetized" source is retired (Business Rules §4: no
+    edits after publishing); the queue's two sources are pending earnings
+    decisions and moderator take-downs, each with an honest time basis."""
+    import uuid
+
+    _, author_token, _ = register_and_token(client)
+    ah = _auth(author_token)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+
+    token = uuid.uuid4().hex[:12]
+    pending_id = _make_pending(client, ah, token)
+    taken_id = _make_pending(client, ah, token, stars=4)
+    assert client.post(f"/api/v1/admin/reviews/{taken_id}/unpublish", headers=mh,
+                       json={"reason": "Test take-down."}).status_code == 200
+
+    def view(name: str) -> dict:
+        response = client.get(
+            f"/api/v1/admin/review-queue?q={token}&limit=10&view={name}", headers=mh)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    # MQA-015: the two sources are two views - the work, and what was taken down.
+    waiting, taken = view("waiting"), view("taken_down")
+    assert [i["review"]["id"] for i in waiting["items"]] == [pending_id]
+    assert [i["review"]["id"] for i in taken["items"]] == [taken_id]
+    assert waiting["total"] == 1 and taken["total"] == 1
+    assert waiting["counts"]["by_view"] == {"waiting": 1, "taken_down": 1}
+    assert waiting["items"][0]["queue_time_basis"] == "review_created_at"
+    assert taken["items"][0]["queue_time_basis"] == "review_updated_at"
+    assert not any(item["edited_since_monetized"]
+                   for item in waiting["items"] + taken["items"])
+
+
+@requires_db
+def test_review_queue_invalid_filters_return_422(client):
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    mh = _auth(mod_token)
+    for qs in ("band=urgent", "lane=nowhere", "sla=late", "limit=0", "limit=500",
+               "offset=-1", "view=decided"):
+        resp = client.get(f"/api/v1/admin/review-queue?{qs}", headers=mh)
+        assert resp.status_code == 422, f"{qs} -> {resp.status_code}"
+
+
+@requires_db
+def test_review_queue_non_moderator_forbidden(client):
+    _, author_token, _ = register_and_token(client)
+    resp = client.get("/api/v1/admin/review-queue?band=high&limit=2",
+                      headers=_auth(author_token))
+    assert resp.status_code == 403
+
+
+def test_assess_open_queue_aggregates_the_whole_backlog(monkeypatch):
+    """`assess_open_queue` is the Overview's only view of the queue, and every
+    DB-backed test of it skips on a machine without PostgreSQL. This pins the
+    derivation itself: totals from the same cards, and `reported` meaning at
+    least one report — NOT the reported lane, which a manual escalation outranks.
+    """
+    import uuid as _uuid
+
+    from app.services import referral_service
+    from app.services.moderation_priority import PriorityBand, PriorityLane, SlaState
+
+    high = _uuid.uuid4()
+    normal = _uuid.uuid4()
+    low = _uuid.uuid4()
+    cards = [
+        _assessed_card(high, (0, 0, 0, _NOW, _NOW), band=PriorityBand.high,
+                       lane=PriorityLane.escalated, sla=SlaState.overdue,
+                       report_count=2),
+        _assessed_card(normal, (1, 1, 0, _NOW, _NOW), band=PriorityBand.normal,
+                       lane=PriorityLane.reported, sla=SlaState.approaching,
+                       report_count=1),
+        _assessed_card(low, (3, 2, 0, _NOW, _NOW), band=PriorityBand.low,
+                       lane=PriorityLane.routine, sla=SlaState.on_track),
+    ]
+    monkeypatch.setattr(referral_service, "_all_queue_candidates", lambda db: [])
+    monkeypatch.setattr(
+        referral_service, "_build_assessed_cards", lambda db, reviews, now=None: cards
+    )
+
+    summary = referral_service.assess_open_queue(object())
+
+    assert summary.total == 3
+    assert summary.counts.by_band == {"high": 1, "normal": 1, "low": 1}
+    assert summary.counts.by_sla == {"overdue": 1, "approaching": 1, "on_track": 1}
+    assert summary.counts.by_lane["escalated"] == 1
+    assert summary.high_priority == 1
+    assert summary.approaching == 1
+    assert summary.overdue == 1
+    # The escalated card carries reports even though its lane says "escalated".
+    assert summary.reported_review_ids == {high, normal}
+    assert [r.id for r in summary.reviews] == [high, normal, low]
+
+
+@requires_db
+def test_queue_card_carries_the_reviewer_snapshot_and_comment_count(client):
+    """The two figures the console had to draw as unavailable (contract §17, §19).
+
+    `users.verified_review_count` and the review's comment total are both
+    content, not reading telemetry, so serving them leaves the
+    telemetry-isolation gate alone — `test_telemetry_isolation` pins that
+    separately, and the queue must never gain views the same way.
+    """
+    _, author_token, _ = register_and_token(client)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    _, reader_token, _ = register_commenter(client)
+    ah, mh, rh = _auth(author_token), _auth(mod_token), _auth(reader_token)
+
+    # A published, verified review first: it lifts the author's verified count.
+    published = client.post("/api/v1/products", headers=ah, json={
+        "name": f"SnapshotPublished {author_token[-8:]}", "category": "electronics",
+    }).json()["id"]
+    first = client.post("/api/v1/reviews", headers=ah, json={
+        "product_id": published, "title": "Solid", "discussion": "Weeks of use.",
+        "verdict": "yes_absolutely", "star_rating": 4,
+        "photo_url": owned_photo_url(ah),
+    }).json()["id"]
+    assert client.post(f"/api/v1/admin/reviews/{first}/publish",
+                       headers=mh).status_code == 200
+    assert client.post(f"/api/v1/reviews/{first}/comments", headers=rh,
+                       json={"body": "Does it survive a drop?"}).status_code == 201
+
+    # A second review, left in the queue, is the card under test.
+    queued_product = client.post("/api/v1/products", headers=ah, json={
+        "name": f"SnapshotQueued {author_token[-8:]}", "category": "electronics",
+    }).json()["id"]
+    queued = client.post("/api/v1/reviews", headers=ah, json={
+        "product_id": queued_product, "title": "Second", "discussion": "Also good.",
+        "verdict": "it_depends", "star_rating": 3,
+        "photo_url": owned_photo_url(ah),
+    }).json()["id"]
+
+    # Narrowed by the product name. The queue is one shared backlog across the
+    # whole suite, so an unfiltered page of 100 is not guaranteed to contain a
+    # review created a moment ago — it is ordered by priority, not by age.
+    page = client.get("/api/v1/admin/review-queue", headers=mh,
+                      params={"q": f"SnapshotQueued {author_token[-8:]}", "limit": 100})
+    assert page.status_code == 200, page.text
+    items = page.json()["items"]
+    card = next((i for i in items if i["review"]["id"] == queued), None)
+    assert card is not None, f"the queued review is not in the filtered queue: {items}"
+
+    assert card["author"]["verified_review_count"] == 1
+    assert card["author"]["verified_review_count"] != card["signals"]["author_review_count"]
+    # This card's own review has no comments; the count is the review's, not
+    # the author's, so it must not pick up the other review's thread.
+    assert card["comment_count"] == 0
+
+    assert first not in [i["review"]["id"] for i in items], (
+        "a published review must not be in the queue"
+    )
+
+
+@requires_db
+def test_an_approved_lazada_link_opens_its_listing(client):
+    """QA-006, round 2: "Buy it here" must work for each marketplace on its own.
+
+    The Shopee path is the full flow above. This is the same promise for
+    Lazada: an admin-attached exact product page turns the button on, the
+    button's /r/ hop lands on that listing (with Lazada's per-review sub_id
+    where the URL carries it), and a review without an active link has no
+    destination at all rather than a fabricated one."""
+    _, author_token, _ = register_and_token(client)
+    _, mod_token, _ = register_and_token(client, role="administrator")
+    rid, _ = _make_review(client, _auth(author_token), stars=4)
+
+    # Before approval: published, but no shop destination.
+    assert client.get(f"/api/v1/reviews/{rid}").json().get("referral_redirect_url") is None
+    assert client.get(f"/r/{rid}", follow_redirects=False).status_code == 404
+
+    listing = f"https://www.lazada.com.ph/products/fan-i{uuid.uuid4().int % 10**9}.html"
+    attach = client.post(f"/api/v1/admin/reviews/{rid}/referral-link",
+                         headers=_auth(mod_token), json={"url": listing, "platform": "lazada"})
+    assert attach.status_code == 200, attach.text
+    assert attach.json()["referral_redirect_url"] == f"/r/{rid}"
+
+    resp = client.get(f"/r/{rid}", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"].startswith(listing)

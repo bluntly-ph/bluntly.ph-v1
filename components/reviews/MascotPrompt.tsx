@@ -1,0 +1,107 @@
+import Image from "next/image";
+
+import { SimpleBunbunMark } from "@/components/reviews/SimpleBunbunMark";
+
+/**
+ * Bunbun asking the reviewer the question a step is really about.
+ *
+ * The composer's step references draw the mascot under a speech bubble — the
+ * heading states the topic ("Your verdict"), and Bunbun asks the actual question
+ * ("Would you recommend this to a friend?"). Without it the step reads as a bare
+ * form; with it, it reads as being asked something.
+ *
+ * TWO TREATMENTS, and the references decide which:
+ *
+ *   "simple"   the flat orange silhouette, composed from the owner's three
+ *              primitives (see SimpleBunbunMark). Used while the step is still
+ *              unanswered.
+ *   "detailed" the full illustration, 504-BUNBUN-BASIC-NEUTRAL.svg from the
+ *              authorized asset pack. Used once the reader has answered and the
+ *              mascot reacts.
+ *
+ * That mapping is measured, not assumed. A connected-component pass over the
+ * reference frames finds the three exact primitives in Reviewer step 2, step 2.1,
+ * step 5 and step 5.1 — and NOT in step 2.2, which is the frame where a verdict
+ * has been chosen and Bunbun asks "mind telling us why?". So the silhouette is
+ * the idle state and the illustration is the reaction.
+ *
+ * Decorative: the question is real text in the bubble, so the image itself is
+ * `alt=""` and hidden from assistive tech rather than described twice.
+ */
+export type MascotVariant = "simple" | "detailed";
+
+export function MascotPrompt({
+  children,
+  variant = "simple",
+  markInset = 49,
+  className = "",
+}: {
+  children: React.ReactNode;
+  /** Which treatment the corresponding reference frame draws. */
+  variant?: MascotVariant;
+  /**
+   * How far the mark sits in from the content edge. 49 in the composer steps;
+   * "Let's talk money.png" is a narrower card and draws it at 29. The bubble
+   * is always 43px further in than the mark, in both.
+   */
+  markInset?: number;
+  className?: string;
+}) {
+  return (
+    <div className={className}>
+      {/* Bubble above and to the right, mascot below and to the left — not the
+          two of them side by side. Measured in "Reviewer Page - Step 5.png",
+          whose content box starts at x16:
+
+            bubble  x108..323 (216 wide), y296..369
+            tail    x128..141, y370..382 — below the bubble, pointing at the duck
+            duck    x65..127, y385..444 — the mark's own 63x60, unscaled
+
+          so the bubble is inset 92px from the content edge and the duck 49px,
+          and the duck's head overlaps the tail rather than sitting beside it.
+
+          "Let's talk money.png" draws the same arrangement in a narrower card
+          — duck x53..115 (the same 63x60), bubble x97..310 (214 wide) — so the
+          insets are 29 and 72 there. The gap between them is 43 either way,
+          which is why only the mark's inset is a prop. */}
+      {/* Figma "Reviewer Page - Step 2" / "Step 5" (4435:1092, 4519:5414): a
+          216px bubble at radius 12, 20px sides and 16px top and bottom, 14px
+          Regular on a 21px line, with a drop shadow (0 4px 2px, 25%) that takes
+          in the tail — so it is a filter on the wrapper, not a box-shadow on
+          the box — and the mark 15px under it. */}
+      <div
+        className="max-w-[216px] drop-shadow-[0_4px_2px_rgba(0,0,0,0.25)]"
+        style={{ marginLeft: markInset + 43 }}
+      >
+        <div className="relative flex min-h-[74px] items-center rounded-[12px] bg-[var(--surface-card)] px-5 py-4">
+          <p className="text-[14px] leading-[21px] text-[var(--text-primary)]">{children}</p>
+          <span
+            aria-hidden="true"
+            className="absolute -bottom-[7px] left-[20px] h-4 w-4 rotate-45 rounded-[3px] bg-[var(--surface-card)]"
+          />
+        </div>
+      </div>
+
+      <div className="mt-[15px]" style={{ marginLeft: markInset }}>
+        {variant === "simple" ? (
+          // 63x60 native; the reference draws it unscaled.
+          <SimpleBunbunMark />
+        ) : (
+          <Image
+            src="/mascots/bunbun-neutral.svg"
+            alt=""
+            aria-hidden="true"
+            width={72}
+            height={116}
+            // 7122x11465 artwork; the height here is what the reference shows,
+            // and the width follows the ratio.
+            className="h-[116px] w-auto shrink-0 select-none"
+            priority={false}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default MascotPrompt;

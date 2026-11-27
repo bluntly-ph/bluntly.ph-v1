@@ -1,0 +1,11 @@
+# Dev/test-only dependencies (not installed in the runtime image).
+# Runtime deps come from pyproject.toml; the tools below mirror its
+# [project.optional-dependencies].dev group, so `pip install -e ".[dev]"` and
+# this file give the same result.
+-r requirements.txt
+pytest>=8.3
+ruff>=0.7
+# Load testing (M3 slice 14) — see loadtest/locustfile.py and docs/LOADTEST_RESULTS.md
+locust>=2.31
+# Ranking simulation figures — see sim/ and docs/RANKING_SIMULATION.md
+matplotlib>=3.9

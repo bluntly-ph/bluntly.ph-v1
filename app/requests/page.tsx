@@ -1,0 +1,165 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { PlusCircle, Users } from "@phosphor-icons/react/dist/ssr";
+
+import { RequestUpvote } from "@/components/requests/RequestUpvote";
+import { BrowseLayout, RAIL_ACTION, RailGroup, TakePartGroup } from "@/components/site/BrowseRails";
+import { SiteFooter } from "@/components/site/SiteFooter";
+import { Unavailable } from "@/components/site/Unavailable";
+import { SiteHeader, type HeaderUser } from "@/components/site/SiteHeader";
+import { CtaLink } from "@/components/ui/CtaLink";
+import { getUser } from "@/lib/dal";
+import { getRequests } from "@/lib/requests";
+import { getSessionToken } from "@/lib/session";
+
+export const metadata: Metadata = {
+  title: "Requests — bluntly",
+};
+
+export default async function RequestsPage() {
+  // The cookie read is local, so the token costs nothing before the network work.
+  const token = await getSessionToken();
+  // Parallel: the viewer and the board are independent (see app/page.tsx).
+  const [me, requests] = await Promise.all([
+    getUser().catch(() => null),
+    // Token passed so each row knows whether this viewer already up-voted it
+    // (BUG-026); anonymous readers get the same board with my_upvote false.
+    getRequests("demand", token),
+  ]);
+  const user: HeaderUser = me ? { username: me.username, avatarUrl: me.avatar_url, role: me.role } : null;
+  const canVote = me !== null;
+
+  return (
+    <div className="flex min-h-dvh flex-col bg-[var(--surface-app)]">
+      <SiteHeader user={user} />
+      {/* WEBSITE (`lg` and up): the browsing rails, the same frame /feed,
+          /search and /questions use. */}
+      <main className="flex flex-1 flex-col">
+        <BrowseLayout
+          current="requests"
+          outerClassName="mx-auto w-full max-w-[52rem] flex-1 px-6 py-8 lg:max-w-[76rem] lg:px-10 lg:py-10"
+          aside={
+            <>
+              <RailGroup title="How requests work">
+                <p className="mt-3 text-[13px] leading-[20px] text-[var(--text-secondary)]">
+                  Anyone can ask for a product to be reviewed. Up-votes move a request up the board, and
+                  reviewers pick from the top. Every review of the product answers it; once the asker picks
+                  the Best Answer it leaves the board and stays on its own page.
+                </p>
+                <ul className="mt-3 flex flex-col gap-2 text-[13px]">
+                  <li>
+                    <Link href="/requests/new" className={RAIL_ACTION}>
+                      Post a request
+                    </Link>
+                  </li>
+                </ul>
+              </RailGroup>
+              <TakePartGroup className="mt-8" />
+            </>
+          }
+        >
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h1 className="text-[24px] font-bold text-[var(--text-primary)]">Review requests</h1>
+              <p className="mt-1 text-[14px] text-[var(--text-secondary)]">
+                Can&rsquo;t find a review? Ask for one — up-votes push the most wanted questions to the top.
+              </p>
+            </div>
+            {/* A link, not a <Link> wrapped around a <Button> (QA-012). That
+              nested a button inside an anchor — invalid — and a <button>
+              renders with cursor:default, so nothing said it was clickable. */}
+            <CtaLink href="/requests/new" size="sm" icon={<PlusCircle size={16} weight="fill" />}>
+              Post a request
+            </CtaLink>
+          </div>
+
+          {requests === null ? (
+            <Unavailable what="the request board" />
+          ) : requests.length > 0 ? (
+            <ul className="mt-6 flex flex-col gap-3">
+              {requests.map((r) => (
+                <li
+                  key={r.id}
+                  // A request's own anchor: its up-vote notices link here (QA-067).
+                  id={`request-${r.id}`}
+                  className="flex scroll-mt-24 gap-4 rounded-[var(--radius-sm)] bg-[var(--surface-card)] p-4 shadow-[var(--shadow-card)]"
+                >
+                  <RequestUpvote
+                    requestId={r.id}
+                    count={r.upvote_count}
+                    canVote={canVote}
+                    myUpvote={r.my_upvote}
+                  />
+                  <div className="min-w-0 flex-1">
+                    {r.product_name ? (
+                      <p className="text-[12px] text-[var(--text-secondary)]">About {r.product_name}</p>
+                    ) : null}
+                    <div className="flex flex-wrap items-center gap-2">
+                      {/* The request's own page is its permanent home (dev/QA
+                        sync 2026-09-29): its answers, and the asker's pick. */}
+                      <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">
+                        <Link href={`/requests/${r.id}`} className="hover:underline">
+                          {r.title}
+                        </Link>
+                      </h2>
+                      {/* Demand, not a purse. The badge showed a token reward
+                        until that economy was retired; how many people are
+                        waiting on the answer is the useful signal for a
+                        reviewer deciding what to write next. */}
+                      {r.upvote_count > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-[var(--radius-md)] bg-[color-mix(in_srgb,var(--accent-primary)_12%,transparent)] px-2 py-0.5 text-[12px] font-medium text-[var(--accent-primary)]">
+                          <Users size={13} weight="fill" />
+                          {r.upvote_count} waiting
+                        </span>
+                      ) : null}
+                      {r.answer_count ? (
+                        <Link
+                          href={`/requests/${r.id}`}
+                          className="inline-flex items-center rounded-[var(--radius-md)] bg-[var(--line-hairline-10)] px-2 py-0.5 text-[12px] font-medium text-[var(--text-secondary)] hover:underline"
+                        >
+                          {r.answer_count} {r.answer_count === 1 ? "answer" : "answers"} · waiting for the asker to pick
+                        </Link>
+                      ) : null}
+                    </div>
+                    <p className="mt-1 line-clamp-2 text-[13px] text-[var(--text-secondary)]">{r.details}</p>
+                    <div className="mt-1">
+                      {/* Same -my/py hit-area trick as the header and footer
+                        links: the text is 19px tall, which fails WCAG 2.5.8.
+                        This one only surfaces when the board has a request, so
+                        the a11y spec missed it while the board was empty. */}
+                      {/* The asker's own review never answers their own request
+                        (request_service.answers): their link is to the answers. */}
+                      {me && r.requester_id === me.id ? (
+                        <Link
+                          href={`/requests/${r.id}`}
+                          className="-my-2.5 inline-flex items-center py-2.5 text-[13px] font-medium text-[var(--accent-primary)] hover:underline"
+                        >
+                          {r.answer_count ? "Pick the Best Answer →" : "Your request · see who answers →"}
+                        </Link>
+                      ) : (
+                        <Link
+                          href={r.product_id ? `/reviews/new?product=${encodeURIComponent(r.product_id)}` : "/reviews/new"}
+                          className="-my-2.5 inline-flex items-center py-2.5 text-[13px] font-medium text-[var(--accent-primary)] hover:underline"
+                        >
+                          Answer with a review →
+                        </Link>
+                      )}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="mt-6 rounded-[var(--radius-sm)] bg-[var(--surface-card)] p-10 text-center shadow-[var(--shadow-hairline-inset)]">
+              <p className="text-[15px] font-semibold text-[var(--text-primary)]">No open requests</p>
+              <p className="mt-1 text-[14px] text-[var(--text-secondary)]">
+                Be the first to ask the community for a review.
+              </p>
+            </div>
+          )}
+        </BrowseLayout>
+      </main>
+      <SiteFooter />
+    </div>
+  );
+}

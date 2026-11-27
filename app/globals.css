@@ -1,0 +1,320 @@
+@import "tailwindcss";
+
+/* Design-system tokens, vendored from the Claude Design System project.
+   These are the single source of truth for every colour, size and shadow. */
+@import "./tokens/colors.css";
+@import "./tokens/typography.css";
+@import "./tokens/effects.css";
+
+/* Bridge the token custom properties into Tailwind v4 utilities. */
+@theme inline {
+  --color-surface-app: var(--surface-app);
+  --color-surface-card: var(--surface-card);
+  --color-surface-inverse: var(--surface-inverse);
+  --color-surface-input: var(--surface-input);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-text-on-brand: var(--text-on-brand);
+  --color-text-on-inverse: var(--text-on-inverse);
+
+  --color-border-default: var(--border-default);
+  --color-border-subtle: var(--border-subtle);
+
+  --color-accent: var(--accent-primary);
+  --color-accent-strong: var(--accent-primary-strong);
+  --color-accent-success: var(--accent-success);
+  --color-accent-trust: var(--accent-trust);
+  --color-accent-danger: var(--accent-danger);
+  --color-accent-star: var(--accent-star);
+
+  --color-ink: var(--base-ink-800);
+  --color-gray-placeholder: var(--base-gray-200);
+
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+
+  --radius-xs: var(--radius-xs);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-pill: var(--radius-pill);
+
+  --shadow-card: var(--shadow-card);
+  --shadow-fab: var(--shadow-fab);
+  --shadow-sheet: var(--shadow-sheet);
+
+  --ease-standard: var(--ease-standard);
+}
+
+/* The design is light-only. Declaring it stops browsers from auto-darkening
+   form controls and scrollbars for users whose OS is set to dark. */
+html {
+  color-scheme: light;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* QA-036: iOS Safari zooms the page into any focused field whose text is under
+   16px, and the page stays zoomed while the reader types. One rule for every
+   text field on a phone-sized screen, rather than a size on each input; the
+   desktop layouts keep their drawn 14px. */
+@media (max-width: 767px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+  textarea,
+  select {
+    font-size: max(16px, 1em) !important;
+  }
+}
+
+body {
+  background: var(--surface-app);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  /* Members write what they like, including one unbroken 4,000-character
+     string (review d2525f8d…, 2026-09-28): without this it ran straight out of
+     the page. `break-word` breaks a word only when it cannot fit its line, so
+     ordinary text is untouched; flex children holding user text also carry
+     `min-w-0`, where a long word would otherwise widen the item instead. */
+  overflow-wrap: break-word;
+}
+
+/* A button that can be pressed shows the hand. QA-012 twice: the primitive in
+   components/ui/Button carries `cursor-pointer`, but a hand-rolled <button>
+   renders with `cursor: default` and reads as inert — twelve of them did,
+   including the landing hero's own search submit.
+
+   In @layer base on purpose. Tailwind's utilities sit in a later layer, so any
+   button that genuinely wants something else — the full-screen scrims behind
+   the sheets, which are dismiss targets rather than controls, and the disabled
+   Rate a Seller — keeps its `cursor-default` / `cursor-not-allowed` without
+   needing to out-specify this. `:not(:disabled)` leaves disabled controls to
+   `disabled:cursor-not-allowed`. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+}
+
+/* Links ease their colour on hover/focus so navigation feels alive. */
+a {
+  transition: color var(--duration-fast) var(--ease-standard);
+}
+
+/* ---- Motion: entrance + page-transition animations ---- */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A bottom sheet rises from the bottom edge (Figma prototype: Move in, 300ms,
+   ease out — Commission breakdown 9057:46614 -> 9177:53790). */
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+
+.animate-sheet-up {
+  animation: sheet-up 300ms cubic-bezier(0, 0, 0.2, 1) backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-sheet-up {
+    animation: none;
+  }
+}
+
+/* Route transitions: app/template.tsx re-mounts per navigation and plays this.
+   Opacity only — a transform here would break the sticky header's positioning. */
+.animate-page {
+  animation: fade-in var(--duration-base) var(--ease-standard) both;
+}
+
+.animate-fade-up {
+  animation: fade-up 0.5s var(--ease-standard) both;
+}
+
+/* Stagger helpers for sequential reveals. */
+.delay-1 {
+  animation-delay: 60ms;
+}
+.delay-2 {
+  animation-delay: 120ms;
+}
+.delay-3 {
+  animation-delay: 180ms;
+}
+.delay-4 {
+  animation-delay: 240ms;
+}
+
+/* The source file authors no focus states (it is a static design). These are
+   ours — an interface that cannot be operated from a keyboard is not
+   shippable. */
+/* In @layer base (2026-10-07): unlayered, it outranked every Tailwind utility, so
+   a field that draws its own focus (Figma SearchField/Inline, LinkField, Admin
+   TopSearch / ToolbarSearch, Dropdown/Pill — components/ui/search-styles.ts)
+   could not remove it with `outline-none`, nor keep its radius: the home search
+   showed its orange edge, a second ring 2px outside, and 4px corners. Layered,
+   it is still the default ring for everything that draws none. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+/* Console fields draw their own focus state (Figma Admin/Input, Admin/Textarea:
+   brand border + 3px ring, components/console/fields.ts). The outline above is
+   unlayered, so Tailwind's outline-none could never remove it and those fields
+   showed both. They opt out with this class; everything else keeps the outline. */
+.console-field:focus-visible {
+  outline: none;
+}
+
+/* Public fields too (Figma TextField 6808:456: focus is the field's own border,
+   #EF5821 at 80%, components/ui/field-styles.ts). The radius is the field's own
+   class now that the rule above is layered. */
+.public-field:focus-visible {
+  outline: none;
+}
+
+/* Composer cards that draw their own focus (a 1px brand inset on the white
+   card, Figma Step 1.1 / 4.1 / 5.1): without this they showed the outline
+   above as a second orange ring 2px outside. Radius stays the card's own. */
+.own-focus:focus-visible {
+  outline: none;
+}
+
+/* ---- Long-form content (About, How it works, Terms, FAQs, …) ----
+   The design has no editorial-typography spec, so this is a restrained,
+   readable prose scale built entirely from the design tokens. */
+.prose {
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1.7;
+}
+.prose > * + * {
+  margin-top: 1rem;
+}
+.prose h1 {
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+.prose h2 {
+  color: var(--text-primary);
+  font-size: 20px;
+  font-weight: 600;
+  margin-top: 2.25rem;
+}
+.prose h3 {
+  color: var(--text-primary);
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 1.5rem;
+}
+.prose .lead {
+  font-size: 17px;
+  line-height: 1.6;
+}
+/* `:not([data-cta])` is load-bearing (QA-007). This rule is specificity
+   (0,0,1,1); Tailwind's `.text-white` is (0,0,1,0), so a CTA placed inside an
+   article had its label repainted accent-orange on an accent-orange fill and
+   was invisible until hover tinted the background. `components/ui/CtaLink`
+   sets the attribute. */
+.prose a:not([data-cta]) {
+  color: var(--accent-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose a:not([data-cta]):hover {
+  color: var(--accent-primary-strong);
+}
+.prose strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.25rem;
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li + li {
+  margin-top: 0.4rem;
+}
+.prose li::marker {
+  color: var(--text-muted);
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--line-hairline-10);
+  margin: 2rem 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* QA-022/033: a search field that draws its own clear button hides the
+   browser's, so there is one × rather than two. Only those fields: a plain
+   type="search" elsewhere keeps the native control as its way to clear. */
+.no-native-search-clear::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+/* ---- reports (components/reports) ----
+   Print or "Save as PDF" straight from the report page: the console's rail,
+   the site header and every control drop away, tables print whole instead of
+   inside their scroll box, and the report reads as a document. */
+@media print {
+  body * { visibility: hidden; }
+  .report-root, .report-root * { visibility: visible; }
+  .report-root { position: absolute; inset: 0 auto auto 0; width: 100%; padding: 0; }
+  .report-no-print { display: none !important; }
+  .report-scroll { overflow: visible !important; }
+  .report-section { box-shadow: none !important; break-inside: auto; }
+  .report-root table { font-size: 10px; min-width: 0 !important; }
+  .report-root tr { break-inside: avoid; }
+}

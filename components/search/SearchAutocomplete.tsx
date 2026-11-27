@@ -1,0 +1,371 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useEffect, useId, useRef, useState } from "react";
+import { ClockCounterClockwise, MagnifyingGlass, UserCircle, X } from "@phosphor-icons/react/dist/ssr";
+
+import { RECENT_SEARCHES_KEY, parseRecentSearches } from "./recent-searches-model";
+import { comboKeyAction } from "./search-combobox-model";
+
+/**
+ * The search field, with product suggestions.
+ *
+ * Three QA findings shaped this:
+ *
+ * QA-008 — a partial query surfaced a useful match but there was no way to act
+ * on it. Suggestions are now selectable, by pointer or keyboard, and selecting
+ * one runs the search for that product rather than leaving the reader to retype
+ * it.
+ *
+ * QA-009 — the results had no interactive treatment. Options carry a pointer
+ * cursor, a hover and an active-descendant highlight, and `aria-selected`, so
+ * the highlighted row is the same row Enter will choose.
+ *
+ * QA-010 — suggestions appeared for an empty field. Nothing is requested until
+ * the query has `MIN_QUERY` non-whitespace characters, and clearing the input
+ * drops the list immediately rather than leaving the previous one on screen.
+ *
+ * It stays a real `<form action="/search">`: with JavaScript unavailable, or
+ * before hydration, submitting still searches. The listbox is an enhancement on
+ * top of that, not a replacement for it.
+ *
+ * `tone="strong"` is the search page's own field: the frames draw its magnifier
+ * and clear glyph at 24px in the ink colour, where the compact header and
+ * landing fields use a muted 20px glyph.
+ */
+
+const MIN_QUERY = 2;
+const DEBOUNCE_MS = 250;
+
+type Suggestion =
+  | { kind: "product"; id: string; canonical_name: string | null; category: string | null }
+  | { kind: "person"; id: string; username: string; display_name: string | null };
+
+export function SearchAutocomplete({
+  defaultValue = "",
+  placeholder = "Search or ask anything",
+  inputClassName,
+  showClear = false,
+  tone = "muted",
+  recents = false,
+}: {
+  defaultValue?: string;
+  placeholder?: string;
+  inputClassName: string;
+  showClear?: boolean;
+  tone?: "muted" | "strong";
+  /**
+   * The typing state of "Screen/Mobile Search" (6852:641): while the field has
+   * focus and no product suggestions are showing, the reader's recent searches
+   * on this device. See RecentSearchesPanel.
+   */
+  recents?: boolean;
+}) {
+  const router = useRouter();
+  const listId = useId();
+  const [query, setQuery] = useState(defaultValue);
+  // Results are stored WITH the query that produced them, and the highlight
+  // with the query it belongs to. Both are then derived rather than cleared
+  // from an effect — clearing state inside an effect schedules a cascading
+  // render, which this project lints against, and deriving is also what makes
+  // a stale list impossible rather than merely unlikely.
+  const [result, setResult] = useState<{ q: string; items: Suggestion[] }>({
+    q: "",
+    items: [],
+  });
+  const [highlight, setHighlight] = useState<{ q: string; i: number }>({ q: "", i: -1 });
+  // Start dismissed when the field arrives pre-filled from `?q=`.
+  //
+  // Otherwise /search?q=jisulife mounts with an eligible query, fetches, and
+  // drops a suggestion list over the results the reader just asked for —
+  // covering the tabs and the first rows before they have touched anything.
+  // Suggestions are for a query being typed; a query that came from the URL has
+  // already been submitted. Typing, or ArrowDown, opens the list as usual.
+  const [dismissed, setDismissed] = useState(defaultValue.trim().length > 0);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  const trimmed = query.trim();
+  const eligible = trimmed.length >= MIN_QUERY;
+  // QA-010: below the threshold there is nothing to show, whatever was fetched
+  // for a previous query. An emptied field therefore shows nothing at once.
+  const items = eligible && result.q === trimmed ? result.items : [];
+  const active = highlight.q === trimmed && highlight.i < items.length ? highlight.i : -1;
+  const open = !dismissed && items.length > 0;
+  const strong = tone === "strong";
+  // Read from storage when the field gains focus — in the event handler, not an
+  // effect — so the list is current without a cascading render.
+  const [history, setHistory] = useState<string[] | null>(null);
+  const showRecents = recents && history !== null && history.length > 0 && !open;
+
+  const setActive = (i: number) => setHighlight({ q: trimmed, i });
+
+  useEffect(() => {
+    // Nothing is requested below the threshold; the list is already empty by
+    // derivation above, so there is no state to clear here.
+    if (!eligible) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        // Products and people (owner, 2026-09-28: "a searchable user … so
+        // they can go to other people's profile"), fetched together. A failed
+        // people lookup leaves the product suggestions standing.
+        const [res, peopleRes] = await Promise.all([
+          fetch(`/api/bff/api/v1/products?q=${encodeURIComponent(trimmed)}&limit=6&browse=true`),
+          fetch(`/api/bff/api/v1/users/search?q=${encodeURIComponent(trimmed)}&limit=3`).catch(() => null),
+        ]);
+        if (!res.ok) throw new Error(String(res.status));
+        const data = (await res.json()) as { id: string; canonical_name: string | null; category: string | null }[];
+        const people =
+          peopleRes && peopleRes.ok
+            ? ((await peopleRes.json()) as { id: string; username: string; display_name: string | null }[])
+            : [];
+        if (cancelled) return;
+        setResult({
+          q: trimmed,
+          items: [
+            ...(Array.isArray(data) ? data : []).map((p) => ({ kind: "product" as const, ...p })),
+            ...(Array.isArray(people) ? people : []).map((p) => ({ kind: "person" as const, ...p })),
+          ],
+        });
+      } catch {
+        if (!cancelled) setResult({ q: trimmed, items: [] });
+      }
+    }, DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [trimmed, eligible]);
+
+  // A click outside closes the list without clearing what was typed.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setDismissed(true);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open]);
+
+  function choose(s: Suggestion) {
+    if (s.kind === "person") {
+      setDismissed(true);
+      router.push(`/u/${encodeURIComponent(s.username)}`);
+      return;
+    }
+    const name = s.canonical_name?.trim();
+    if (!name) return;
+    setQuery(name);
+    setDismissed(true);
+    router.push(`/search?q=${encodeURIComponent(name)}`);
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    // The decision lives in `comboKeyAction` so it can be tested without a DOM.
+    // In particular `preventDefault` on Escape is load-bearing: `type="search"`
+    // clears itself otherwise, which wiped the query the dismissal was meant to
+    // keep. See that module for why.
+    const action = comboKeyAction(e.key, {
+      open,
+      dismissed,
+      eligible,
+      itemCount: items.length,
+      active,
+    });
+    if (action.preventDefault) e.preventDefault();
+    switch (action.type) {
+      case "dismiss":
+        setDismissed(true);
+        break;
+      case "reopen":
+        setDismissed(false);
+        // Highlight the first option as the list comes back, per the ARIA
+        // combobox pattern — otherwise the list is visible with nothing current.
+        if (action.to !== null) setActive(action.to);
+        break;
+      case "move":
+        setActive(action.to);
+        break;
+      case "choose":
+        choose(items[action.index]);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <form action="/search" role="search" className="relative">
+        <MagnifyingGlass
+          size={strong ? 28 : 20}
+          className={
+            strong
+              ? "pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[var(--text-primary)]"
+              : "pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]"
+          }
+        />
+        <input
+          type="search"
+          name="q"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setDismissed(false);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && showRecents) setHistory(null);
+            onKeyDown(e);
+          }}
+          onFocus={() => {
+            if (!recents) return;
+            try {
+              setHistory(parseRecentSearches(window.localStorage.getItem(RECENT_SEARCHES_KEY)));
+            } catch {
+              setHistory([]);
+            }
+          }}
+          onBlur={() => setHistory(null)}
+          placeholder={placeholder}
+          // QA-022: without this the browser drops its OWN form-history list
+          // (every earlier "ma", "Man" typed into a field named `q`) over ours —
+          // a dark native panel on mobile, which is the "black overlay" with
+          // "repeated search terms" in the report. This field has its own
+          // suggestions and its own recent searches.
+          autoComplete="off"
+          aria-label="Search"
+          role="combobox"
+          aria-expanded={open}
+          aria-controls={open ? listId : undefined}
+          aria-autocomplete="list"
+          aria-activedescendant={
+            open && active >= 0 ? `${listId}-${active}` : undefined
+          }
+          // QA-022/033: where this field draws its own "Clear search" ×, the
+          // browser's native one is hidden — otherwise a type="search" field
+          // shows two clear buttons side by side (WebKit/Blink).
+          className={`${inputClassName}${showClear ? " no-native-search-clear" : ""}`}
+        />
+        {showClear && query ? (
+          <button
+            type="button"
+            aria-label="Clear search"
+            onClick={() => {
+              setQuery("");
+              // The field is not the only thing showing the query: the results
+              // below are server-rendered from `?q=`. Clearing only local state
+              // left an empty box above a full result list, and a reload
+              // brought the query back.
+              if (new URLSearchParams(window.location.search).get("q")) {
+                router.push("/search");
+              }
+            }}
+            className={
+              strong
+                ? "absolute right-2 top-1/2 grid h-11 w-11 -translate-y-1/2 cursor-pointer place-items-center rounded-full text-[var(--text-primary)] hover:bg-[var(--line-hairline-10)]"
+                : "absolute right-3 top-1/2 grid h-9 w-9 -translate-y-1/2 cursor-pointer place-items-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--line-hairline-10)]"
+            }
+          >
+            <X size={strong ? 28 : 20} />
+          </button>
+        ) : null}
+      </form>
+
+      {/* Figma "Screen/Mobile Search" (6852:641), read 2026-09-14: 24px under
+          the field and 8px further in, rows of a 32px ClockCounterClockwise 12px
+          before the query in 16px Regular at 0.8px tracking, on a 48px pitch.
+          Choosing one keeps focus in the field until the search runs, so the
+          panel does not blink shut under the pointer.
+
+          INTENTIONAL PRODUCT DIFFERENCE: the frame's divider and "Most
+          searched today:" rows are not drawn. Nothing counts searches across
+          readers, and a list of popular queries with no data behind it would
+          be invented. */}
+      {showRecents && history ? (
+        <div className="absolute inset-x-0 top-full z-30 min-h-[50dvh] bg-[var(--surface-app)] px-2 pb-8 pt-6">
+          <ul aria-label="Recent searches" className="flex flex-col gap-4">
+            {history.map((item) => (
+              <li key={item}>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    setQuery(item);
+                    setHistory(null);
+                    setDismissed(true);
+                    router.push(`/search?q=${encodeURIComponent(item)}`);
+                  }}
+                  className="flex h-8 w-full cursor-pointer items-center gap-3 text-left text-[16px] leading-none tracking-[0.8px] text-[var(--text-primary)] hover:text-[var(--accent-primary)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-primary)]"
+                >
+                  <ClockCounterClockwise size={32} aria-hidden="true" className="shrink-0" />
+                  <span className="min-w-0 truncate">{item}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {open ? (
+        <ul
+          id={listId}
+          role="listbox"
+          aria-label="Suggestions"
+          className="absolute inset-x-0 top-[calc(100%+0.35rem)] z-30 overflow-hidden rounded-[var(--radius-sm)] bg-[var(--surface-card)] py-1 shadow-[var(--shadow-card)] ring-1 ring-[var(--line-hairline-10)]"
+        >
+          {items.map((s, i) => (
+            <li key={`${s.kind}-${s.id}`} role="none">
+              {/* A div, not a button. The WAI-ARIA combobox pattern keeps DOM
+                  focus on the input and points at the current option with
+                  `aria-activedescendant`; a focusable option contradicts that,
+                  and a focused <button> is activated by `click`, never by the
+                  `mousedown` this needs to beat the input's blur. So: not
+                  focusable, and both handlers. */}
+              <div
+                id={`${listId}-${i}`}
+                role="option"
+                aria-selected={i === active}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  choose(s);
+                }}
+                onClick={() => choose(s)}
+                onMouseEnter={() => setActive(i)}
+                className={`flex w-full cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-[14px] ${
+                  i === active
+                    ? "bg-[var(--line-hairline-10)] text-[var(--text-primary)]"
+                    : "text-[var(--text-primary)]"
+                }`}
+              >
+                {s.kind === "person" ? (
+                  <>
+                    <UserCircle size={15} className="shrink-0 text-[var(--text-muted)]" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {s.display_name ? `${s.display_name} ` : ""}
+                      <span className="text-[var(--text-secondary)]">@{s.username}</span>
+                    </span>
+                    <span className="shrink-0 text-[12px] text-[var(--text-muted)]">Profile</span>
+                  </>
+                ) : (
+                  <>
+                    <MagnifyingGlass size={15} className="shrink-0 text-[var(--text-muted)]" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {s.canonical_name ?? "Unnamed product"}
+                    </span>
+                    {s.category ? (
+                      <span className="shrink-0 text-[12px] capitalize text-[var(--text-muted)]">
+                        {s.category.replace(/-/g, " ")}
+                      </span>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+export default SearchAutocomplete;

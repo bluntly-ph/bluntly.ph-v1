@@ -1,0 +1,231 @@
+import "server-only";
+
+import { headers as requestHeaders } from "next/headers";
+import { unstable_rethrow } from "next/navigation";
+
+import { VIA_BFF, edgeClientIp, signedClientIpHeaders } from "@/lib/client-ip-signature";
+
+import { ApiError, type Problem } from "./errors";
+import { API_ORIGIN } from "./origin";
+
+/**
+ * The single place the frontend talks to FastAPI.
+ *
+ * Server-only by construction: the access token lives in an httpOnly cookie and
+ * is attached here, on the server, so it never reaches client JavaScript. Client
+ * components go through the BFF route handler instead of importing this.
+ */
+
+/**
+ * Deadline for every backend call. See `buildInit` for why it exists.
+ *
+ * Comfortably under the serverless function limit, so our own "backend
+ * unreachable" answer wins the race against the platform's error page, and far
+ * above the 150–350ms these calls actually take in production.
+ */
+const REQUEST_TIMEOUT_MS = 8_000;
+
+export type RequestOptions = {
+  method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+  /** JSON body. Mutually exclusive with `form` and `body`. */
+  json?: unknown;
+  /** Sent as application/x-www-form-urlencoded — the login endpoint needs this. */
+  form?: Record<string, string>;
+  /** Raw body, for multipart uploads. */
+  body?: BodyInit;
+  token?: string | null;
+  headers?: Record<string, string>;
+  /** Defaults to "no-store": auth-shaped data must never be cached. */
+  cache?: RequestCache;
+  /**
+   * Seconds to keep this response in Next's Data Cache. Opt-in, and **ignored
+   * whenever `token` is set** — a per-user response in a shared cache is how one
+   * reader ends up seeing another's session. Only pass this for genuinely public
+   * reads (the feed, a published review, the question list).
+   *
+   * Worth having because the pages stay dynamically rendered — they read the
+   * session cookie, so the Full Route Cache never applies — but the Data Cache
+   * is independent of that, so the backend round trip can still be skipped.
+   */
+  revalidate?: number;
+  /** Data Cache tags for a cached read, so a write can expire it (lib/cache-tags.ts). */
+  tags?: string[];
+  signal?: AbortSignal;
+};
+
+function buildInit(options: RequestOptions): RequestInit {
+  const headers: Record<string, string> = { ...options.headers };
+  let body: BodyInit | undefined;
+
+  if (options.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.json);
+  } else if (options.form) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    body = new URLSearchParams(options.form).toString();
+  } else if (options.body !== undefined) {
+    // Let fetch set the multipart boundary itself.
+    body = options.body;
+  }
+
+  if (options.token) {
+    headers.Authorization = `Bearer ${options.token}`;
+  }
+
+  const init: RequestInit = {
+    method: options.method ?? "GET",
+    headers,
+    body,
+    // A caller may pass its own signal; otherwise every request gets a deadline.
+    //
+    // Without one, `transportProblem` below can only fire for a refused
+    // connection — a backend that accepts and then never answers hangs the
+    // render until the platform kills the whole function, and the reader gets
+    // the platform's error page instead of ours. The app already knows how to
+    // say "backend unreachable"; it just could not reach that branch.
+    //
+    // Comfortably under the serverless limit so our message wins the race,
+    // and far above the 150–350ms these calls actually take.
+    signal: options.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  };
+
+  // `cache` and `next.revalidate` are mutually exclusive, so this is either/or.
+  // The `!options.token` guard is the load-bearing half: it makes caching a
+  // credentialed response impossible by construction rather than by remembering.
+  if (options.revalidate !== undefined && !options.token) {
+    (init as RequestInit & { next?: { revalidate: number; tags?: string[] } }).next = {
+      revalidate: options.revalidate,
+      ...(options.tags?.length ? { tags: options.tags } : {}),
+    };
+  } else {
+    init.cache = options.cache ?? "no-store";
+  }
+  return init;
+}
+
+/**
+ * Whether this call can land in Next's shared Data Cache: a public GET with a
+ * revalidate window and no token (the same rule `buildInit` applies).
+ */
+export function isCacheableCall(options: RequestOptions): boolean {
+  return (
+    (options.method ?? "GET") === "GET" &&
+    !options.token &&
+    options.revalidate !== undefined
+  );
+}
+
+/**
+ * The visitor's address, signed, for the API's rate limits and vote signal.
+ *
+ * Server-side calls reach the API from this function's own address, which is
+ * shared by every visitor, so the API used to count every login, vote and
+ * comment against a few dozen shared counters. The address the Vercel edge
+ * reported for the visitor is forwarded signed instead, exactly as the BFF
+ * does (app/api/bff/[...path]/route.ts); backend/app/core/client_ip.py checks
+ * it. `x-bluntly-bff` marks the call as ours either way.
+ *
+ * Only ever for calls that cannot be cached: a per-visitor header on a cached
+ * fetch would split the shared cache per visitor, or worse, serve one
+ * visitor's signed address with another's response.
+ */
+async function visitorHeaders(): Promise<Record<string, string>> {
+  let incoming: Headers;
+  try {
+    incoming = await requestHeaders();
+  } catch (error) {
+    // Next's own request-time signals must propagate; anything else means
+    // there is no visitor request here (a build step), so nothing to forward.
+    unstable_rethrow(error);
+    return {};
+  }
+  const secret = process.env.CLIENT_IP_SIGNING_SECRET;
+  const ip = edgeClientIp(incoming, process.env.VERCEL === "1");
+  return {
+    [VIA_BFF]: "1",
+    ...(secret && ip ? signedClientIpHeaders(ip, secret) : {}),
+  };
+}
+
+/** A transport failure still has to reach callers as an ApiError. */
+function transportProblem(path: string, cause: unknown): Problem {
+  return {
+    type: "about:blank",
+    title: "Backend unreachable",
+    status: 503,
+    detail:
+      cause instanceof Error
+        ? `Could not reach the API: ${cause.message}`
+        : "Could not reach the API.",
+    instance: path,
+    code: "backend_unreachable",
+  };
+}
+
+export async function apiFetch<T>(
+  path: string,
+  options: RequestOptions = {},
+): Promise<T> {
+  const url = path.startsWith("http") ? path : `${API_ORIGIN}${path}`;
+
+  const init = buildInit(options);
+  if (!isCacheableCall(options)) {
+    init.headers = { ...(init.headers as Record<string, string>), ...(await visitorHeaders()) };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch (cause) {
+    throw new ApiError(transportProblem(path, cause));
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const isJson =
+    contentType.includes("application/json") ||
+    contentType.includes("application/problem+json");
+  // A malformed body is a provider fault, not a caller error, and it must
+  // arrive as an ApiError like everything else — `response.json()` throws a
+  // bare SyntaxError, which would escape this layer and surface as an
+  // unhandled render error. The same discipline the backend adapters apply to
+  // their own providers.
+  let payload: unknown;
+  try {
+    payload = isJson ? await response.json() : await response.text();
+  } catch (cause) {
+    throw new ApiError({
+      type: "about:blank",
+      title: "Unreadable response",
+      status: 502,
+      detail:
+        cause instanceof Error
+          ? `The API returned a body that could not be read: ${cause.message}`
+          : "The API returned a body that could not be read.",
+      instance: path,
+      code: "bad_response_body",
+    });
+  }
+
+  if (!response.ok) {
+    // Every backend error is problem+json; anything else means we hit a proxy,
+    // a crash page, or the wrong host. Normalise it so callers see one shape.
+    const problem: Problem =
+      isJson && payload && typeof payload === "object" && "code" in payload
+        ? (payload as Problem)
+        : {
+            type: "about:blank",
+            title: "Unexpected error",
+            status: response.status,
+            detail: typeof payload === "string" ? payload : response.statusText,
+            instance: path,
+            code: `http_${response.status}`,
+          };
+    throw new ApiError(problem);
+  }
+
+  return payload as T;
+}

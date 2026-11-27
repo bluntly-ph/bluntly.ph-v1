@@ -1,0 +1,47 @@
+{
+  "name": "bluntly-ph",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "dev:all": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "dev:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -Stop",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test:frontend": "node --experimental-strip-types --test \"tests/frontend/*.test.mjs\"",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "audit:contract": "node scripts/contract-audit.mjs",
+    "link-check": "node scripts/link-check.mjs",
+    "page-weight": "node scripts/page-weight.mjs",
+    "sitemap": "node --experimental-strip-types scripts/sitemap.mjs",
+    "sitemap:docs": "node --experimental-strip-types scripts/sitemap.mjs --write-docs",
+    "gen:api": "openapi-typescript docs/openapi.json -o lib/api-types.d.ts"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "cobe": "^2.0.1",
+    "next": "16.3.1",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "chrome-launcher": "^1.2.1",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.12",
+    "lighthouse": "^13.4.1",
+    "openapi-typescript": "^7.13.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
+  }
+}

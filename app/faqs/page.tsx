@@ -1,0 +1,89 @@
+import type { Metadata } from "next";
+
+import { Article, type Block } from "@/components/site/Article";
+import { CtaLink } from "@/components/ui/CtaLink";
+import { StaticPageShell } from "@/components/site/StaticPageShell";
+
+/**
+ * Built once and served from the CDN (cost plan, 2026-10-22). "error" fails the
+ * build if anything here ever reads cookies, headers or uncached data, rather
+ * than quietly rendering every visit again: tests/frontend/static-pages.test.mjs.
+ */
+export const dynamic = "error";
+
+export const metadata: Metadata = {
+  title: "FAQs — bluntly",
+  description:
+    "Answers to common questions about bluntly: how reviewers earn, how reviews are verified, payouts, and getting started.",
+};
+
+const FAQS: { q: string; a: string }[] = [
+  {
+    q: "Is bluntly free?",
+    a: "Yes. Reading reviews and asking questions is completely free. Writing reviews is free too — and it can earn you money.",
+  },
+  {
+    q: "How do reviewers earn?",
+    a: "When your published review drives a sale through its “Buy it here” link, it earns an affiliate commission. Reviewers receive a share of that, plus rewards from the Honesty Fund.",
+  },
+  {
+    q: "Do I have to write only positive reviews to earn?",
+    a: "No — and that is the whole idea. The Honesty Fund pays honest reviewers regardless of their verdict, so a well-argued “Hard pass” is just as valuable as a rave.",
+  },
+  {
+    q: "How are reviews verified?",
+    a: "Every review begins with a real purchase link, and an administrator checks each submission before it goes live. Reviewers also build standing through six trust stages as their track record grows.",
+  },
+  {
+    q: "When and how do I get paid?",
+    a: "Earnings collect in your wallet. Once your balance reaches ₱300, you can withdraw it to PayPal from your dashboard.",
+  },
+  {
+    q: "What can I review?",
+    a: "Anything you actually bought on Shopee, Lazada, TikTok Shop, or Amazon. Paste the purchase link to get started.",
+  },
+  {
+    q: "Are the “Buy it here” links safe?",
+    a: "Yes. They route through bluntly to the seller you already know. bluntly may earn a commission at no extra cost to you — that is what funds honest reviews and reviewer payouts.",
+  },
+  {
+    q: "Can I ask a question about a product?",
+    a: "Yes. Use Q&A to ask owners and verified buyers directly — helpful answers earn badges and recognition.",
+  },
+  {
+    q: "How do I start?",
+    a: "Sign in with your email, paste a purchase link, and write your first review. An administrator takes it from there.",
+  },
+];
+
+const BLOCKS: Block[] = [
+  {
+    type: "lead",
+    text: "The short answers. Still stuck? Reach us any time — the contact page has the details.",
+  },
+  ...FAQS.flatMap(
+    (f): Block[] => [
+      // h2: each question follows the page h1 directly; h3 skipped a level
+      // (Lighthouse heading-order, 2026-09-17).
+      { type: "h2", text: f.q },
+      { type: "p", text: f.a },
+    ],
+  ),
+];
+
+export default function FaqsPage() {
+  return (
+    <StaticPageShell>
+      <Article title="Frequently asked questions" blocks={BLOCKS}>
+        <div className="mt-8 flex flex-wrap gap-3">
+          <CtaLink href="/how-it-works">
+            See how it works
+          </CtaLink>
+          <CtaLink href="/contact" variant="secondary">
+            Contact us
+          </CtaLink>
+        </div>
+      </Article>
+    </StaticPageShell>
+  );
+}

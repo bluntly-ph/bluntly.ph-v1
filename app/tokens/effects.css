@@ -1,0 +1,50 @@
+/* bluntly.ph — spacing, radius & shadow tokens
+   Vendored verbatim from the Claude Design System project. */
+
+:root {
+  /* ---- spacing scale (as observed: 4/8/12/16/20/24/32px grid) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- corner radii ---- */
+  --radius-xs: 5px;     /* Action Menu container clip */
+  --radius-sm: 12px;    /* cards, photo tiles, inputs w/ padding */
+  --radius-md: 16px;    /* chips / filter pills */
+  --radius-pill: 32px;  /* search bars, primary buttons, bottom-sheet handles */
+  --radius-circle: 50%; /* avatars, FAB, dots */
+
+  /* ---- shadows (literal from source) ---- */
+  --shadow-card: 0px 4px 4px 0px var(--shadow-color-25);
+  --shadow-fab: 0px 5px 4px 0px var(--shadow-color-25);
+  --shadow-sheet: 0px 1px 8px 0px var(--shadow-color-25);
+  /* Figma effect style Shadow/Modal: "modals, confirms, menus and popovers in the
+     admin and seller consoles". One token instead of the value repeated per menu. */
+  --shadow-modal: 0px 8px 12px 0px var(--shadow-color-10);
+  /* Figma Menu (7761:7939): the consumer dropdown card under a sort pill. */
+  --shadow-menu: 0px 4px 16px 0px rgba(0, 0, 0, 0.12);
+  /* Field focus / error rings (Figma: 3px spread, brand at 16 %, danger at 14 %). */
+  --ring-field-focus: 0 0 0 3px rgba(239, 88, 33, 0.16);
+  --ring-field-error: 0 0 0 3px rgba(216, 0, 39, 0.14);
+  /* The selected segment of a console segmented control (tabs such as Queue /
+     All reviews, Claims / Appeals): one value instead of one per screen. */
+  --shadow-segment: 0px 1px 1px 0px rgba(0, 0, 0, 0.06);
+  --shadow-inverse-glow: 0px -4px 4px 0px rgba(255, 255, 255, 0.25);
+  --shadow-hairline-inset: inset 0 0 0 1px var(--line-hairline-10);
+
+  /* ---- motion ---- */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+
+  /* ---- control sizing (measured from the auth frames) ---- */
+  --control-input-h: 48px;
+  --control-button-h: 56px;
+  --gutter-mobile: 32px;
+}

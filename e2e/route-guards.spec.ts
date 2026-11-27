@@ -1,0 +1,129 @@
+import { test, expect } from "@playwright/test";
+
+/**
+ * Auth guards, and the `?next=` return path specifically.
+ *
+ * Regression origin: `?next=` was dead end to end. `proxy.ts` set it, the login
+ * page never rendered it as a field, and `verifyOtp` never read it — so signing
+ * in always dumped you on `/`, whatever you had been trying to reach. Build,
+ * typecheck, lint and a 200-check all passed the whole time it was broken, which
+ * is why it needs a test at this level rather than a unit test.
+ *
+ * Guards live in two places and only one of them sets `next`:
+ *   - proxy.ts        — PROTECTED array, optimistic cookie check, sets ?next=
+ *   - lib/dal.ts      — requireUser, real backend check, bare /login redirect
+ * A protected route missing from proxy.ts still redirects, but loses the return
+ * path. That is exactly the silent failure this matrix catches.
+ */
+
+const GATED = [
+  "/dashboard",
+  "/contracts",
+  "/profile",
+  "/admin",
+  "/onboarding",
+  "/reviews/new",
+  "/questions/new",
+  "/requests/new",
+  "/sellers/rate",
+  "/notifications",
+  // A dynamic segment: the proxy matches this one by pattern (lib/route-access.ts).
+  "/sellers/any-store/dashboard",
+] as const;
+
+const PUBLIC = [
+  "/",
+  "/about",
+  "/search",
+  "/questions",
+  "/requests",
+  "/categories",
+  "/membership",
+  "/how-it-works",
+  "/faqs",
+  "/terms",
+  "/privacy",
+] as const;
+
+test.describe("gated routes", () => {
+  for (const path of GATED) {
+    test(`${path} redirects to login preserving the return path`, async ({ page }) => {
+      const response = await page.goto(path);
+
+      expect(response?.status(), `${path} should render the login page`).toBe(200);
+      await expect(page).toHaveURL(/\/login/);
+
+      // The whole point: the destination survives the bounce.
+      const next = new URL(page.url()).searchParams.get("next");
+      expect(next, `${path} must arrive at /login with ?next=`).toBe(path);
+    });
+  }
+
+  test("the login page carries next into the form as a hidden field", async ({ page }) => {
+    await page.goto("/reviews/new");
+    await expect(page).toHaveURL(/\/login\?next=%2Freviews%2Fnew/);
+
+    // Step 1 collects the email; `next` is held in React state and only rendered
+    // as a field on the OTP step, so assert the flow reached step 1 intact.
+    await expect(page.getByPlaceholder("Email address")).toBeVisible();
+    await expect(page.locator('input[name="purpose"]')).toHaveValue("login");
+  });
+});
+
+test.describe("public routes", () => {
+  for (const path of PUBLIC) {
+    test(`${path} renders without a server error`, async ({ page }) => {
+      const response = await page.goto(path);
+      expect(response?.status(), `${path} should be 200`).toBe(200);
+      // 200 is not proof of rendering — an error boundary returns 200 too.
+      await expect(page.locator("body")).not.toBeEmpty();
+      await expect(page.getByText(/Application error|Internal Server Error/i)).toHaveCount(0);
+    });
+  }
+});
+
+test("unknown paths 404", async ({ page }) => {
+  const response = await page.goto("/no-such-page-should-404");
+  expect(response?.status()).toBe(404);
+});
+
+test("an unknown login email is sent to sign up instead of a dead OTP step", async ({ page }) => {
+  await page.goto("/login");
+  // A unique, syntactically deliverable address. The login endpoint returns
+  // before issuing an OTP when it is absent, so this neither sends mail nor
+  // creates a row in the database.
+  await page.getByPlaceholder("Email address").fill("otp-login-missing-0019a47a@example.com");
+  await page.getByRole("button", { name: /^send code$/i }).click();
+
+  // Scoped to the form: Next renders its own empty `role="alert"` route
+  // announcer on every page, so a bare getByRole("alert") either resolves to
+  // that empty div or trips strict mode once the real error appears.
+  await expect(page.locator("form").getByRole("alert")).toContainText(
+    /don.t have an account yet/i,
+  );
+  await expect(page.getByRole("link", { name: /create an account/i })).toHaveAttribute(
+    "href",
+    "/signup",
+  );
+  await expect(page.getByRole("heading", { name: /enter the code/i })).toHaveCount(0);
+});
+
+/**
+ * The profile's three sections are one route with a `?tab=`, so the guard has
+ * to cover the query too (owner P0.3, 2026-09-16). A bookmark to
+ * `/profile?tab=stats` must bounce through login and come back to the tab the
+ * reader asked for — not to the bare profile, which is where a guard that
+ * matches on pathname alone would leave them.
+ */
+test.describe("profile sections behind the guard", () => {
+  for (const tab of ["comments", "stats"] as const) {
+    test(`/profile?tab=${tab} returns to its own tab after login`, async ({ page }) => {
+      const path = `/profile?tab=${tab}`;
+      const response = await page.goto(path);
+
+      expect(response?.status(), `${path} should render the login page`).toBe(200);
+      await expect(page).toHaveURL(/\/login/);
+      expect(new URL(page.url()).searchParams.get("next")).toBe(path);
+    });
+  }
+});

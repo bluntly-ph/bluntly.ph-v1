@@ -1,0 +1,187 @@
+import type { NextRequest } from "next/server";
+
+import { VIA_BFF, edgeClientIp, signedClientIpHeaders } from "./client-ip-signature.ts";
+
+/**
+ * Report one page request's coarse location for the traffic panel.
+ *
+ * WHY IT LIVES IN THE PROXY. This is the only code path that sees a genuine
+ * visitor request. Server-rendered pages reach the API through
+ * `lib/api/client.ts`, which builds its headers from scratch and forwards none
+ * of the visitor's — so a backend that read its own request headers would
+ * record the location of the Vercel function on every render, and the chart
+ * would show our own datacenter as the source of all traffic.
+ *
+ * WHAT IT COUNTS. Page requests, and only page requests. Not `/api/*`, not
+ * prefetches, not asset requests. That makes the number one an operator can
+ * actually interpret; mixing navigations with the XHR they trigger would
+ * inflate a "busy" city purely because its readers clicked more.
+ *
+ * When the page is a review, the same beacon carries its id so the view is
+ * counted too. Views are "times opened", never "unique readers" — telling
+ * those apart would mean identifying readers, which is the one thing this
+ * subsystem exists not to do.
+ *
+ * PRIVACY. The edge has already turned the address into a place. The address
+ * itself goes to the API only signed, for its per-visitor rate limit, and the
+ * API keeps nothing but a keyed hash of it in the counter. What is recorded is
+ * a country, a coarse region/city, the edge's own approximate coordinates for
+ * that city, and the serving POP.
+ */
+
+// The edge's geography headers. Absent off Vercel, which is why local
+// development records nothing at all rather than inventing a location.
+const H_COUNTRY = "x-vercel-ip-country";
+const H_REGION = "x-vercel-ip-country-region";
+const H_CITY = "x-vercel-ip-city";
+const H_LAT = "x-vercel-ip-latitude";
+const H_LON = "x-vercel-ip-longitude";
+const H_ID = "x-vercel-id";
+
+/**
+ * A review page, captured so the same beacon can count the view.
+ *
+ * A view IS the page request — counting it separately would mean a second
+ * beacon for an event we have already observed. Anchored and UUID-shaped so
+ * `/reviews/new` and any other non-id segment cannot be mistaken for a review.
+ */
+const REVIEW_PATH =
+  /^\/reviews\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+
+/** Reserved "unresolved" codes. `T1` is the Tor exit pseudo-country. */
+const UNRESOLVED = new Set(["", "-", "xx", "zz", "t1"]);
+
+function clean(value: string | null): string | undefined {
+  const text = (value ?? "").trim();
+  return !text || UNRESOLVED.has(text.toLowerCase()) ? undefined : text;
+}
+
+function coord(value: string | null): number | undefined {
+  const text = clean(value);
+  if (text === undefined) return undefined;
+  const n = Number(text);
+  // Dropped rather than clamped: a clamped coordinate is a made-up location.
+  return Number.isFinite(n) && n >= -180 && n <= 180 ? n : undefined;
+}
+
+/**
+ * Requests that must never be counted.
+ *
+ * `/api` first, and for two reasons: the beacon itself is an `/api/v1` request,
+ * so counting them would make every page view recurse; and API calls are not
+ * navigations.
+ */
+function isCountable(request: NextRequest): boolean {
+  if (request.method !== "GET") return false;
+  const { pathname } = request.nextUrl;
+  if (pathname.startsWith("/api")) return false;
+  // A prefetch is the browser guessing, not a person arriving. These header
+  // checks CANNOT see a Next router prefetch: Next strips the Flight headers
+  // (and `_rsc`) from the request a proxy is handed. Router prefetches are kept
+  // out one level up, by the `missing` clause in proxy.ts's matcher, which is
+  // evaluated before that stripping — before this was moved there, every review
+  // link scrolled into view counted as a view of that review. `purpose:
+  // prefetch` is the browser's own (link rel=prefetch) and does survive.
+  if (request.headers.get("next-router-prefetch")) return false;
+  if (request.headers.get("purpose") === "prefetch") return false;
+  // Crawlers, link unfurlers and lab tools are not readers. Their opens were
+  // counted as review views, and those views feed the admin's momentum facts —
+  // a Lighthouse audit alone adds several per review it visits.
+  if (NON_HUMAN_AGENT.test(request.headers.get("user-agent") ?? "")) return false;
+  // What remains is a document request or a client-side navigation's payload
+  // fetch. Both are a person opening the page: in an app-router site a click on
+  // a link never produces a document request, so the payload fetch IS the
+  // visit and must count.
+  return true;
+}
+
+/**
+ * User agents that declare themselves automated. Only the self-declared ones:
+ * guessing at disguised bots belongs to the fraud layer, not to a counter.
+ */
+export const NON_HUMAN_AGENT =
+  /[a-z]bot[/-]|(?:^|[^a-z])bot\b(?![ -]?[a-z0-9]*\d)|crawl|spider|slurp|facebookexternalhit|embedly|linkexpanding|headless|lighthouse|pagespeed|pingdom|uptimerobot|curl\/|wget\/|python-requests|axios\//i;
+
+const SESSION_COOKIE = process.env.SESSION_COOKIE_NAME ?? "bluntly_session";
+
+/**
+ * The beacon, or null when there is nothing worth reporting.
+ *
+ * Returns a promise the caller hands to `event.waitUntil` so it settles after
+ * the response is already on its way — analytics must never be on the critical
+ * path of a page load.
+ */
+export function trafficBeacon(request: NextRequest): Promise<unknown> | null {
+  if (!isCountable(request)) return null;
+
+  const country = clean(request.headers.get(H_COUNTRY));
+  const reviewId = REVIEW_PATH.exec(request.nextUrl.pathname)?.[1];
+
+  // No country means the edge could not place this request — off-platform, or
+  // simply unresolved. Recording it as "unknown" would put a large permanent
+  // bar in a chart whose only job is showing where traffic comes from.
+  //
+  // A review view does NOT depend on knowing where the reader is, so an
+  // unplaceable request still counts as a view. Tying the two together would
+  // silently undercount views for exactly the readers we cannot locate.
+  if (!country && !reviewId) return null;
+
+  const vercelId = clean(request.headers.get(H_ID)) ?? "";
+  const pop = vercelId.split("::", 1)[0]?.toLowerCase();
+  const city = clean(request.headers.get(H_CITY));
+
+  const body = JSON.stringify({
+    review_id: reviewId,
+    country: country?.toUpperCase(),
+    region: clean(request.headers.get(H_REGION)),
+    // Vercel percent-encodes city names; left encoded, `Ho%20Chi%20Minh`
+    // ranks as a separate city from `Ho Chi Minh`.
+    city: city ? safeDecode(city) : undefined,
+    latitude: coord(request.headers.get(H_LAT)),
+    longitude: coord(request.headers.get(H_LON)),
+    pop: pop && /^[a-z0-9]{1,8}$/.test(pop) ? pop : undefined,
+  });
+
+  // Same-origin: `/api/v1/*` is rewritten to the backend service by
+  // vercel.json, so this needs no API origin variable.
+  const url = new URL("/api/v1/internal/traffic", request.url);
+
+  // A failed beacon must never surface to the reader, whose page rendered
+  // perfectly well. Swallowing is the correct behaviour, not laziness.
+  // For a review open, forward the reader's own session so the backend can
+  // leave the author's and administrators' opens out of the view count. Same
+  // origin, so the token goes nowhere it was not already going.
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const session = reviewId ? request.cookies.get(SESSION_COOKIE)?.value : undefined;
+  if (session) headers.authorization = `Bearer ${session}`;
+
+  // Only our proxy may record views (they feed the admin's monetization
+  // attention list), so the beacon carries the shared secret. It can, because
+  // it runs on the server; a browser-sent beacon never could. The visitor's
+  // address goes signed, so the API rate-limits per visitor rather than per
+  // proxy instance. backend/app/api/v1/routes/traffic_ingest.py checks both.
+  const key = process.env.TRAFFIC_BEACON_SECRET;
+  if (key) headers["x-traffic-key"] = key;
+  headers[VIA_BFF] = "1";
+  const signingSecret = process.env.CLIENT_IP_SIGNING_SECRET;
+  const ip = edgeClientIp(request.headers, process.env.VERCEL === "1");
+  if (signingSecret && ip) Object.assign(headers, signedClientIpHeaders(ip, signingSecret));
+
+  return fetch(url, {
+    method: "POST",
+    headers,
+    body,
+    cache: "no-store",
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // Malformed percent-encoding: keep the raw value rather than dropping a
+    // real city because one byte was wrong.
+    return value;
+  }
+}

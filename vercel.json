@@ -1,0 +1,55 @@
+{
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "regions": ["sin1"],
+    "crons": [
+        {
+            "path": "/api/v1/internal/cron/tick",
+            "schedule": "*/5 * * * *"
+        }
+    ],
+    "services": {
+        "frontend": {
+            "root": ".",
+            "framework": "nextjs"
+        },
+        "backend": {
+            "root": "backend",
+            "framework": "fastapi",
+            "functions": {
+                "app/main.py": {
+                    "maxDuration": 300
+                }
+            }
+        }
+    },
+    "rewrites": [
+        {
+            "source": "/api/v1(/.*)?",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/r/(.*)",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/health",
+            "destination": {
+                "type": "service",
+                "service": "backend"
+            }
+        },
+        {
+            "source": "/(.*)",
+            "destination": {
+                "type": "service",
+                "service": "frontend"
+            }
+        }
+    ]
+}
